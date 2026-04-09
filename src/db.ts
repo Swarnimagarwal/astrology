@@ -10,29 +10,47 @@ export const pool = new Pool({
 export async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS astro_users (
-      id            BIGINT PRIMARY KEY,
-      first_name    TEXT,
-      name          TEXT,
-      dob_year      INT,
-      dob_month     INT,
-      dob_day       INT,
-      tob_hour      FLOAT,        -- birth hour in UTC, NULL if unknown
-      pob           TEXT,         -- place of birth string
-      lat           FLOAT,        -- geocoded latitude
-      lon           FLOAT,        -- geocoded longitude
-      state         TEXT NOT NULL DEFAULT 'idle',
-      has_paid      BOOLEAN NOT NULL DEFAULT false,
-      premium_plan  TEXT,
-      premium_expires_at TIMESTAMPTZ,
-      chat_history  JSONB NOT NULL DEFAULT '[]',
-      trial_started_at TIMESTAMPTZ,
-      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      id                      BIGINT PRIMARY KEY,
+      first_name              TEXT,
+      name                    TEXT,
+      dob_year                INT,
+      dob_month               INT,
+      dob_day                 INT,
+      tob_hour                FLOAT,
+      pob                     TEXT,
+      lat                     FLOAT,
+      lon                     FLOAT,
+      state                   TEXT NOT NULL DEFAULT 'idle',
+      has_paid                BOOLEAN NOT NULL DEFAULT false,
+      premium_plan            TEXT,
+      premium_expires_at      TIMESTAMPTZ,
+      chat_history            JSONB NOT NULL DEFAULT '[]',
+      trial_started_at        TIMESTAMPTZ,
+      premium_chat_started_at TIMESTAMPTZ,
+      premium_kundali_count   INT NOT NULL DEFAULT 0,
+      extra_kundalis          JSONB NOT NULL DEFAULT '[]',
+      created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS astro_users_state ON astro_users(state);
     CREATE INDEX IF NOT EXISTS astro_users_paid  ON astro_users(has_paid);
+
+    ALTER TABLE astro_users ADD COLUMN IF NOT EXISTS premium_chat_started_at TIMESTAMPTZ;
+    ALTER TABLE astro_users ADD COLUMN IF NOT EXISTS premium_kundali_count   INT NOT NULL DEFAULT 0;
+    ALTER TABLE astro_users ADD COLUMN IF NOT EXISTS extra_kundalis          JSONB NOT NULL DEFAULT '[]';
   `);
 }
+
+export type ExtraKundali = {
+  name: string;
+  dob_year: number;
+  dob_month: number;
+  dob_day: number;
+  tob_hour: number | null;
+  pob: string;
+  lat: number | null;
+  lon: number | null;
+};
 
 export type User = {
   id: number;
@@ -51,6 +69,9 @@ export type User = {
   premium_expires_at: Date | null;
   chat_history: { role: string; content: string }[];
   trial_started_at: Date | null;
+  premium_chat_started_at: Date | null;
+  premium_kundali_count: number;
+  extra_kundalis: ExtraKundali[];
 };
 
 export async function getUser(id: number): Promise<User | null> {
@@ -84,8 +105,13 @@ export async function upsertUser(id: number, first_name: string, fields: Partial
 
 export async function checkPremiumExpiry(user: User) {
   if (user.has_paid && user.premium_expires_at && new Date() > user.premium_expires_at) {
-    await pool.query(`UPDATE astro_users SET has_paid=false, premium_plan=NULL, premium_expires_at=NULL WHERE id=$1`, [user.id]);
-    return { ...user, has_paid: false, premium_plan: null, premium_expires_at: null };
+    await pool.query(
+      `UPDATE astro_users SET has_paid=false, premium_plan=NULL, premium_expires_at=NULL,
+       premium_chat_started_at=NULL, premium_kundali_count=0, extra_kundalis='[]' WHERE id=$1`,
+      [user.id]
+    );
+    return { ...user, has_paid: false, premium_plan: null, premium_expires_at: null,
+      premium_chat_started_at: null, premium_kundali_count: 0, extra_kundalis: [] };
   }
   return user;
 }
@@ -99,6 +125,17 @@ export async function addChatMessage(id: number, role: string, content: string) 
 
 export async function clearChatHistory(id: number) {
   await pool.query(`UPDATE astro_users SET chat_history='[]', updated_at=NOW() WHERE id=$1`, [id]);
+}
+
+export async function addExtraKundali(id: number, k: ExtraKundali) {
+  await pool.query(
+    `UPDATE astro_users
+     SET extra_kundalis = extra_kundalis || $1::jsonb,
+         premium_kundali_count = premium_kundali_count + 1,
+         updated_at = NOW()
+     WHERE id=$2`,
+    [JSON.stringify([k]), id]
+  );
 }
 
 export async function countUsers(): Promise<{ total: number; paid: number; today: number }> {
