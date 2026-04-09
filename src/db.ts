@@ -83,7 +83,8 @@ export async function upsertUser(id: number, first_name: string, fields: Partial
   const user = await getUser(id);
   if (!user) {
     await pool.query(
-      `INSERT INTO astro_users (id, first_name, state) VALUES ($1,$2,'setup_name')`,
+      `INSERT INTO astro_users (id, first_name, state) VALUES ($1,$2,'setup_name')
+       ON CONFLICT (id) DO NOTHING`,
       [id, first_name]
     );
     return getUser(id) as Promise<User>;
