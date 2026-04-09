@@ -1,69 +1,49 @@
 import TelegramBot from "node-telegram-bot-api";
 import axios from "axios";
 import {
-  getUser, upsertUser, checkPremiumExpiry, addChatMessage,
-  clearChatHistory, countUsers, getUnpaidActiveUsers, pool
+  getUser, upsertUser, checkPremiumExpiry, pool,
+  countUsers, getUnpaidActiveUsers,
 } from "./db.js";
 import {
-  calculateKundali, buildKundaliContext, PLANET_KARAKAS,
-  NAKSHATRA_TRAITS, RASHI_LORDS,
+  calculateKundali, RASHIS, RASHI_LORDS,
 } from "./astro.js";
 
 const TOKEN    = process.env.TELEGRAM_BOT_TOKEN ?? "";
-const GROQ_KEY = process.env.GROQ_API_KEY?.trim() ?? "";
 const ADMIN_ID = Number(process.env.ADMIN_TELEGRAM_ID ?? 0);
 
-if (!TOKEN)    throw new Error("TELEGRAM_BOT_TOKEN is required");
-if (!GROQ_KEY) console.warn("⚠️  GROQ_API_KEY not set — AI responses disabled");
+if (!TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
 
 export const bot = new TelegramBot(TOKEN, { polling: false });
-const POLLING = process.env.RAILWAY_ENVIRONMENT === "production" || process.env.FORCE_POLLING === "true";
+const POLLING =
+  process.env.RAILWAY_ENVIRONMENT === "production" ||
+  process.env.FORCE_POLLING === "true";
 
-// ── Pricing ────────────────────────────────────────────────────────────────────
+// ── Pricing ───────────────────────────────────────────────────────────────────
 const PLANS = {
-  week:  { stars: 150, label: "7 Din",  days: 7  },
+  week:  { stars: 150, label: "7 Din",   days: 7  },
   month: { stars: 500, label: "1 Mahina", days: 30 },
 } as const;
 type PlanKey = keyof typeof PLANS;
 
-const TRIAL_DURATION_MS = 30 * 1000;
-
 function delay(ms: number) { return new Promise(r => setTimeout(r, ms)); }
-const trialTimers = new Map<number, NodeJS.Timeout>();
 
-// ── Groq AI ────────────────────────────────────────────────────────────────────
-async function groqChat(
-  messages: { role: string; content: string }[],
-  maxTokens = 600,
-  temperature = 0.75
-): Promise<string> {
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${GROQ_KEY}` },
-    body: JSON.stringify({
-      model: "llama-3.3-70b-versatile",
-      messages,
-      max_tokens: maxTokens,
-      temperature,
-    }),
-    signal: AbortSignal.timeout(25000),
-  });
-  const json = await res.json() as { choices?: { message?: { content?: string } }[]; error?: { message?: string } };
-  if (!res.ok) throw new Error(json.error?.message ?? `HTTP ${res.status}`);
-  return json.choices?.[0]?.message?.content?.trim() ?? "";
-}
-
-// ── Geocoding ─────────────────────────────────────────────────────────────────
+// ── Geocoding (OpenStreetMap Nominatim — free, no API key) ───────────────────
 async function geocode(city: string): Promise<{ lat: number; lon: number; display: string } | null> {
   try {
     const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(city)}&format=json&limit=1`;
-    const { data } = await axios.get(url, { headers: { "User-Agent": "AstrologyBot/1.0" }, timeout: 8000 });
+    const { data } = await axios.get(url, {
+      headers: { "User-Agent": "AstrologyBot/1.0" }, timeout: 8000,
+    });
     if (!data?.[0]) return null;
-    return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon), display: data[0].display_name.split(",")[0] };
+    return {
+      lat: parseFloat(data[0].lat),
+      lon: parseFloat(data[0].lon),
+      display: data[0].display_name.split(",")[0],
+    };
   } catch { return null; }
 }
 
-// ── Build kundali data for a user ─────────────────────────────────────────────
+// ── Build kundali for a user ──────────────────────────────────────────────────
 function getUserKundali(user: NonNullable<Awaited<ReturnType<typeof getUser>>>) {
   return calculateKundali(
     user.dob_year!, user.dob_month!, user.dob_day!,
@@ -73,304 +53,204 @@ function getUserKundali(user: NonNullable<Awaited<ReturnType<typeof getUser>>>) 
   );
 }
 
-// ── FREE teaser reading ────────────────────────────────────────────────────────
-async function buildTeaserReading(user: NonNullable<Awaited<ReturnType<typeof getUser>>>): Promise<string> {
-  const k = getUserKundali(user);
-  const prompt = `You are a master Vedic astrologer. Give a SHORT but COMPELLING free teaser reading (5-6 lines max).
+// ── Planet emoji map ──────────────────────────────────────────────────────────
+const P_EMOJI: Record<string, string> = {
+  Sun: "☀️", Moon: "🌙", Mars: "♂️", Mercury: "☿", Jupiter: "♃",
+  Venus: "♀️", Saturn: "♄", Rahu: "☊", Ketu: "☋",
+};
+const DIGNITY_EMOJI: Record<string, string> = {
+  Exalted: "✨", "Own Sign": "🏠", Friend: "👍", Neutral: "", Enemy: "⚠️", Debilitated: "🔻",
+};
 
-Person's chart:
-- Sun: ${k.planets.Sun.rashi} at ${k.planets.Sun.degInRashi.toFixed(1)}°
-- Moon: ${k.planets.Moon.rashi}, Nakshatra: ${k.moonNakshatra} Pada ${k.moonNakshatraPada}
-- ${k.lagna ? `Lagna: ${k.lagna.rashi}` : "Birth time unknown"}
-- Current: ${k.currentDasha} Mahadasha → ${k.currentAntardasha} Antardasha
-- Mars: ${k.planets.Mars.rashi}, Jupiter: ${k.planets.Jupiter.rashi}, Saturn: ${k.planets.Saturn.rashi}
+// ── FREE kundali preview (shown after setup) ──────────────────────────────────
+function buildFreePreview(user: NonNullable<Awaited<ReturnType<typeof getUser>>>): string {
+  const k    = getUserKundali(user);
+  const name = user.name ?? "ji";
 
-Write in warm Hinglish. Lead with ONE specific personality insight that feels like you "know" them.
-Then ONE thing about their current life phase based on the dasha.
-End with a compelling teaser: "Tumhari kundali mein [specific thing] bhi hai — full reading mein bataunga..."
-Be specific to the actual rashis/nakshatras. No generic statements. Make them feel understood.`;
-
-  try {
-    return await groqChat([{ role: "user", content: prompt }], 280);
-  } catch {
-    return `🌟 Sun ${k.planets.Sun.rashi} mein — tumhara soul powerful aur purposeful hai.\n🌙 Moon ${k.planets.Moon.rashi}, ${k.moonNakshatra} Nakshatra — tumhara mann bahut gehri feeling rakhta hai.\n\n✨ Abhi ${k.currentDasha} Mahadasha chal raha hai — yeh ek turning point period hai.\n\n🔮 Full kundali mein tumhare career timing, love life aur ek hidden strength bhi hai — woh bhi bataunga...`;
-  }
-}
-
-// ── PREMIUM full kundali reading ──────────────────────────────────────────────
-async function buildFullReading(user: NonNullable<Awaited<ReturnType<typeof getUser>>>): Promise<string> {
-  const k = getUserKundali(user);
-  const ctx = buildKundaliContext(k, user.name ?? "User",
-    `${user.dob_day}/${user.dob_month}/${user.dob_year}`, user.pob ?? "Unknown");
-
-  const year = new Date().getFullYear();
-  const prompt = `You are Pandit Ramesh Shastri, India's most trusted Vedic astrologer. Do a deeply personal, detailed kundali reading.
-
-${ctx}
-
-Write a comprehensive reading covering ALL of these sections with clear headings:
-
-🧬 TUM KAUN HO — PERSONALITY (Sun, Moon, Lagna — who they are at soul level. Be specific to their rashis.)
-
-💼 CAREER & WEALTH (Which planets in which houses. What field suits them. Best career timing. ${year}-${year+2} ka forecast based on current dasha.)
-
-❤️ LOVE & RELATIONSHIPS (7th house lord, Venus/Jupiter placement. When marriage yoga. Current relationship energy. What kind of partner is destined.)
-
-💰 MONEY & PROSPERITY (2nd, 11th house. Jupiter placement. When financial growth periods. What delays wealth and remedy.)
-
-🏥 HEALTH (6th, 8th house. Ascendant lord. What to watch, specific body parts linked to their weak planets.)
-
-🔮 ABHI KYA HO RAHA HAI — ${k.currentDasha}-${k.currentAntardasha} DASHA (This is the MOST important section. Explain exactly what this dasha means for their life RIGHT NOW in ${year}. What opportunities, what challenges, what major events are likely in next 12-18 months. Be very specific.)
-
-💎 TUMHARA HIDDEN STRENGTH (Something unique and positive in their chart that most people miss.)
-
-🙏 REMEDIES (Specific: which gemstone, which mantra with count, which day to fast, which color to wear, what to donate and to whom. All tailored to their chart's weaknesses.)
-
-Write in warm, personal Hinglish. Feel like a wise elder who genuinely cares. Reference actual planets and rashis constantly — no generic sentences allowed.`;
-
-  try {
-    return await groqChat([{ role: "user", content: prompt }], 1200);
-  } catch {
-    return "🙏 Thodi technical difficulty aa gayi. Please 1-2 minute baad dobara try karo.";
-  }
-}
-
-// ── OPENING chat message (the WOW moment) ─────────────────────────────────────
-async function buildOpeningChatMessage(user: NonNullable<Awaited<ReturnType<typeof getUser>>>): Promise<string> {
-  const k = getUserKundali(user);
-  const name = user.name ?? "beta";
-
-  const nt = k.nakshatraTraits;
-  const sadeSatiNote = k.transits.sadeSati.isSadeSati
-    ? `Also subtly acknowledge they may be going through a tough phase (Sade Sati ${k.transits.sadeSati.phase}).`
+  const sadeSatiLine = k.transits.sadeSati.isSadeSati
+    ? `\n⚠️ *Sade Sati chal raha hai* (${k.transits.sadeSati.phase}) — yeh ek important phase hai.`
     : k.transits.sadeSati.isDhaiyya
-    ? `Also subtly note they may be facing some Saturn-related challenges (Dhaiyya running).`
+    ? `\n⚠️ *Dhaiyya chal raha hai* (${k.transits.sadeSati.phase})`
     : "";
 
-  const topYoga = k.activeYogas[0];
+  const activeYogaLine = k.activeYogas.length > 0
+    ? `\n✨ *Tumhare chart mein ${k.activeYogas.length} special yoga(s) hain* — jaise ${k.activeYogas[0].name}${k.activeYogas.length > 1 ? ` aur ${k.activeYogas.length - 1} aur` : ""}`
+    : "";
 
-  const prompt = `You are Pandit Ramesh Shastri — a legendary Vedic astrologer known for saying things that shock people with accuracy.
+  return `🌟 *${name} ji ki FREE Kundali Preview* 🌟
+━━━━━━━━━━━━━━━━━━━━━━━━
 
-You are meeting ${name} for the first time. Their kundali data:
-- Moon: ${k.planets.Moon.rashi}, Nakshatra: ${k.moonNakshatra} Pada ${k.moonNakshatraPada}
-- Nakshatra core nature: "${nt.nature}"
-- Nakshatra hidden shadow: "${nt.shadow}"
-- Nakshatra unique gift: "${nt.gift}"
-- Sun: ${k.planets.Sun.rashi} (${k.planets.Sun.dignity})
-- ${k.lagna ? `Lagna: ${k.lagna.rashi}` : "Birth time not known"}
-- Current dasha: ${k.currentDasha} Mahadasha → ${k.currentAntardasha} Antardasha
-- Strongest planet: ${k.strongestPlanets[0]} | Weakest: ${k.weakestPlanets[0]}
-${topYoga ? `- Special yoga active: ${topYoga.name}` : ""}
-- Jupiter transit: ${k.transits.jupiterTransitNote.slice(0, 80)}
+☀️ *Sun:* ${k.planets.Sun.rashi} — ${k.planets.Sun.dignity}
+🌙 *Moon:* ${k.planets.Moon.rashi} — ${k.planets.Moon.dignity}
+${k.lagna ? `🌅 *Lagna:* ${k.lagna.rashi}` : `🌅 Lagna: _(birth time dene se milega)_`}
 
-Write an opening message (4-5 sentences max) that will GIVE THEM CHILLS:
-1. Start with a warm greeting — "Aao ${name}..." or "Baitho ${name} beta..." 
-2. From the nakshatra nature, say ONE thing about their inner world that they've never been told but deeply feel: e.g. about loneliness, their gift no one sees, what drives them
-3. Say ONE thing about their current life situation based on their ${k.currentDasha}-${k.currentAntardasha} dasha — what energy is moving through their life right now
-${sadeSatiNote}
-4. End with a warm invitation: "Pooch lo — kuch bhi. Main hun 🙏"
+🌙 *Nakshatra:* ${k.moonNakshatra} Pada ${k.moonNakshatraPada}
 
-RULES: No vague statements. Reference the actual nakshatra name and dasha. Write in warm elder-like Hinglish.
-This should feel like the astrologer ALREADY KNOWS them without asking anything.`;
+⏰ *Abhi chal raha hai:* ${k.currentDasha} Mahadasha → ${k.currentAntardasha} Antardasha
+📅 *Dasha kab tak:* ${k.dashaBalance}
+${sadeSatiLine}${activeYogaLine}
 
-  try {
-    return await groqChat([{ role: "user", content: prompt }], 200, 0.8);
-  } catch {
-    return `Aao ${name} beta... 🙏\n\nTumhari kundali mujhe bahut kuch bol rahi hai. ${k.moonNakshatra} nakshatra ka chandra tumhe andar se bahut deeper feel karne wala banata hai — log tumhe samajh nahi paate.\n\nAbhi ${k.currentDasha} dasha ka ek khaas daur hai. Pooch lo — kuch bhi. Main hun.`;
-  }
+━━━━━━━━━━━━━━━━━━━━━━━━
+🔒 _Full kundali mein: saare 9 graha, dignitiy, saare yogas, Sade Sati, current transits, aur life areas analysis — sab tumhare actual planets ke basis pe_`;
 }
 
-// ── ASTROLOGER SYSTEM PROMPT — world-class, deep, accurate ───────────────────
-function buildAstrologerSystemPrompt(user: NonNullable<Awaited<ReturnType<typeof getUser>>>): string {
+// ── FULL kundali (premium) ────────────────────────────────────────────────────
+function buildFullKundali(user: NonNullable<Awaited<ReturnType<typeof getUser>>>): string[] {
   const k    = getUserKundali(user);
-  const ctx  = buildKundaliContext(k, user.name ?? "User",
-    `${user.dob_day}/${user.dob_month}/${user.dob_year}`, user.pob ?? "Unknown");
-  const year = new Date().getFullYear();
-  const name = user.name ?? "beta";
-  const nt   = k.nakshatraTraits;
+  const name = user.name ?? "ji";
+  const dob  = `${user.dob_day}/${user.dob_month}/${user.dob_year}`;
+  const tob  = user.tob_hour != null
+    ? `${String(Math.floor(user.tob_hour)).padStart(2,"0")}:${String(Math.round((user.tob_hour % 1) * 60)).padStart(2,"0")}`
+    : "Unknown";
 
-  const lagnaIdx = k.lagna?.rashiIndex ?? 0;
-  const houseOf  = (pl: string) => k.lagna ? ((k.planets[pl].rashiIndex - lagnaIdx + 12) % 12) + 1 : null;
+  // ── Page 1: Header + Planets ──────────────────────────────────────────────
+  const planetLines = (["Sun","Moon","Mars","Mercury","Jupiter","Venus","Saturn","Rahu","Ketu"] as const)
+    .map(p => {
+      const pos = k.planets[p];
+      const dig = (p !== "Rahu" && p !== "Ketu") ? ` — ${pos.dignity} ${DIGNITY_EMOJI[pos.dignity] ?? ""}` : "";
+      return `${P_EMOJI[p]} *${p.padEnd(8)}:* ${pos.rashi} ${pos.degInRashi.toFixed(1)}°${dig}`;
+    }).join("\n");
 
-  const h = {
-    Sun: houseOf("Sun"), Moon: houseOf("Moon"), Mars: houseOf("Mars"),
-    Mercury: houseOf("Mercury"), Jupiter: houseOf("Jupiter"),
-    Venus: houseOf("Venus"), Saturn: houseOf("Saturn"),
-    Rahu: houseOf("Rahu"), Ketu: houseOf("Ketu"),
-  };
+  const lagnaLine = k.lagna
+    ? `\n🌅 *Lagna (ASC):* ${k.lagna.rashi} ${k.lagna.degInRashi.toFixed(1)}°`
+    : "\n🌅 *Lagna:* Not available (birth time needed)";
 
-  // 7th house lord identification
-  const seventhHouseRashiIdx = k.lagna ? (lagnaIdx + 6) % 12 : null;
-  const seventhHouseLord = seventhHouseRashiIdx !== null ? RASHI_LORDS[seventhHouseRashiIdx] : "Unknown";
+  const page1 = `🔮 *${name} ji ki FULL Vedic Kundali*
+━━━━━━━━━━━━━━━━━━━━━━━━
+📅 DOB: ${dob} | ⏰ TOB: ${tob}
+📍 POB: ${user.pob ?? "Unknown"}
+━━━━━━━━━━━━━━━━━━━━━━━━
 
-  // Active yogas summary
-  const yogaSummary = k.activeYogas.length > 0
-    ? k.activeYogas.map(y => `• ${y.name}: ${y.effect.replace("✅ PRESENT — ","")}`).join("\n")
-    : "• No major yogas detected";
+🪐 *GRAHA (Planetary Positions)*
+${planetLines}${lagnaLine}
 
-  // Sade Sati warning
-  const sadeSatiWarning = k.transits.sadeSati.isSadeSati
-    ? `⚠️ THIS PERSON IS IN SADE SATI (${k.transits.sadeSati.phase}) — This is extremely important context. They may be experiencing ${k.transits.sadeSati.description} Always acknowledge this with compassion when it's relevant to their question.`
-    : k.transits.sadeSati.isDhaiyya
-    ? `⚠️ DHAIYYA RUNNING (${k.transits.sadeSati.phase}) — ${k.transits.sadeSati.description}`
-    : "Saturn in favorable position — no Sade Sati/Dhaiyya currently";
+🏆 *Strongest planets:* ${k.strongestPlanets.join(", ")} — inka use karo
+⚠️ *Weakest planets:* ${k.weakestPlanets.join(", ")} — inhe sambhalo`;
 
-  return `You are Pandit Ramesh Shastri — India's most revered and accurate Vedic astrologer. You trained under Pandit Gopesh Kumar Ojha of Varanasi. You have an uncanny ability to describe what's happening in someone's life without them telling you — because you read it from their kundali.
+  // ── Page 2: Nakshatra + Dasha ─────────────────────────────────────────────
+  const nt = k.nakshatraTraits;
+  const page2 = `🌙 *NAKSHATRA ANALYSIS*
+━━━━━━━━━━━━━━━━━━━━━━━━
 
-You are in a PRIVATE one-on-one consultation with ${name}. You have their COMPLETE Vedic kundali open:
+Moon Nakshatra: *${k.moonNakshatra}* Pada ${k.moonNakshatraPada}
+Deity: ${nt.deity}
+Symbol: ${nt.symbol}
 
-════════════════════════════════════════════════════
-COMPLETE KUNDALI FOR ${(name).toUpperCase()}
-════════════════════════════════════════════════════
-${ctx}
+📖 *Core nature:* ${nt.nature}
 
-KEY DERIVED DATA FOR THIS CONSULTATION:
-• 7th House lord: ${seventhHouseLord} — rules marriage & partnerships
-• Strongest planets: ${k.strongestPlanets.join(", ")} — use these for positive predictions
-• Weakest planets: ${k.weakestPlanets.join(", ")} — need remedies, source of struggles
-• ${sadeSatiWarning}
-• Jupiter transit effect: ${k.transits.jupiterTransitNote}
+🌑 *Hidden shadow:* ${nt.shadow}
 
-ACTIVE YOGAS:
-${yogaSummary}
+🎁 *Unique gift:* ${nt.gift}
 
-MOON NAKSHATRA DEEP PROFILE (${k.moonNakshatra}):
-• Core nature: ${nt.nature}
-• Hidden shadow: ${nt.shadow}
-• Unique gift: ${nt.gift}
-• Deity: ${nt.deity}
-════════════════════════════════════════════════════
+━━━━━━━━━━━━━━━━━━━━━━━━
+⏰ *VIMSHOTTARI DASHA*
 
-══ YOUR IDENTITY & VOICE ══════════════════════════
-You speak like a wise, loving grandfather who knows everything. Warm, direct, never preachy.
-Natural Hinglish: "Dekho beta...", "Haan ji...", "Suno ek baat...", "Yeh toh bahut interesting hai..."
-You reference their NAME naturally. You FEEL what they're going through.
-You NEVER say "I cannot predict", "I'm an AI", "consult a professional", or break character.
+Current: *${k.currentDasha} Mahadasha → ${k.currentAntardasha} Antardasha*
+${k.dashaBalance}
 
-══ HOW TO ANSWER EVERY QUESTION ══════════════════
-STEP 1 — ACKNOWLEDGE: Validate the feeling behind the question first (2-3 words/sentence)
-STEP 2 — READ THE CHART: Look at the specific house/planet relevant to their question
-STEP 3 — CURRENT TIMING: How does their ${k.currentDasha}-${k.currentAntardasha} dasha and current transits affect this?
-STEP 4 — SPECIFIC PREDICTION: Give a concrete prediction with TIMING — month/year range
-STEP 5 — REMEDY: One specific, actionable remedy from their chart's weakness
+Next dashas: ${k.upcomingDashas}`;
 
-══ TOPIC-SPECIFIC ANALYSIS GUIDE ═════════════════
+  // ── Page 3: Yogas ─────────────────────────────────────────────────────────
+  const activeYogas = k.activeYogas;
+  const yogaText = activeYogas.length > 0
+    ? activeYogas.map(y => `✅ *${y.name}*\n   ${y.effect.replace("✅ PRESENT — ","")}`).join("\n\n")
+    : "No major yogas active in this chart.";
 
-LOVE & MARRIAGE:
-→ 7th house is in ${seventhHouseRashiIdx !== null ? `Rashi ${seventhHouseRashiIdx + 1}` : "unknown"}, lord is ${seventhHouseLord}
-→ Venus is in ${k.planets.Venus.rashi} (H${h.Venus ?? "?"}) — ${k.planets.Venus.dignity}
-→ Jupiter is in ${k.planets.Jupiter.rashi} (H${h.Jupiter ?? "?"}) — ${k.planets.Jupiter.dignity}
-→ Rahu in ${k.planets.Rahu.rashi} affects unconventional relationships
-→ If married: check Jupiter for women (husband karaka), Venus for men (wife karaka)
-→ Marriage timing: look at Venus dasha, Jupiter transit over 7th lord
+  const page3 = `✨ *ACTIVE YOGAS IN YOUR CHART* (${activeYogas.length} found)
+━━━━━━━━━━━━━━━━━━━━━━━━
 
-CAREER & SUCCESS:
-→ Sun (career authority) in ${k.planets.Sun.rashi} H${h.Sun ?? "?"} — ${k.planets.Sun.dignity}
-→ Saturn (karma/work) in ${k.planets.Saturn.rashi} H${h.Saturn ?? "?"} — ${k.planets.Saturn.dignity}
-→ 10th house lord: ${k.lagna ? RASHI_LORDS[(lagnaIdx + 9) % 12] : "unknown"}
-→ Mercury (business mind) in ${k.planets.Mercury.rashi} H${h.Mercury ?? "?"} — ${k.planets.Mercury.dignity}
-→ Career timing: 10th house dasha periods, Jupiter transiting 10th from Moon
+${yogaText}
 
-WEALTH & MONEY:
-→ Jupiter (main wealth karaka) in ${k.planets.Jupiter.rashi} — ${k.planets.Jupiter.dignity}
-→ 2nd house lord: ${k.lagna ? RASHI_LORDS[(lagnaIdx + 1) % 12] : "unknown"}
-→ 11th house lord: ${k.lagna ? RASHI_LORDS[(lagnaIdx + 10) % 12] : "unknown"}
-→ Dhana yoga: ${k.activeYogas.find(y => y.name.includes("Dhana"))?.presentInChart ? "YES — financial gains promised" : "Not strongly present"}
-→ Financial peak: Jupiter transiting 2nd, 5th, 9th, 11th from Moon
+${activeYogas.length === 0 ? "_Yogas form specific planetary combinations. Your chart has simpler placements — focus on your strongest planets._" : ""}`;
 
-HEALTH:
-→ 6th house (disease): lord is ${k.lagna ? RASHI_LORDS[(lagnaIdx + 5) % 12] : "unknown"}
-→ Mars in ${k.planets.Mars.rashi} — governs blood, surgery, accidents — ${k.planets.Mars.dignity}
-→ Saturn's weak placement affects: bones, teeth, legs, longevity
-→ Weak planets (${k.weakestPlanets.join(", ")}) indicate body parts to watch
-→ Health remedy: always Sun mantra at sunrise + specific gem for weakest planet
+  // ── Page 4: Transits + Sade Sati ─────────────────────────────────────────
+  const tr = k.transits;
+  const sadeSatiStatus = tr.sadeSati.isSadeSati
+    ? `🔴 *SADE SATI CHAL RAHA HAI!*\n*Phase:* ${tr.sadeSati.phase}\n\n${tr.sadeSati.description}`
+    : tr.sadeSati.isDhaiyya
+    ? `🟡 *DHAIYYA CHAL RAHA HAI*\n*Phase:* ${tr.sadeSati.phase}\n\n${tr.sadeSati.description}`
+    : `✅ *Sade Sati/Dhaiyya nahi chal raha* — Saturn ki position normal hai`;
 
-TIMING PREDICTIONS (use confidently):
-→ Major life shifts happen at dasha changes. Current: ${k.currentDasha}-${k.currentAntardasha}
-→ Next dasha sequence: ${k.upcomingDashas}
-→ Jupiter transits every 12-13 months — HUGE positive trigger when favorable
-→ Saturn transit (current: ${k.transits.saturnCurrentRashi}) lasts 2.5 years
+  const page4 = `🪐 *CURRENT PLANETARY TRANSITS*
+━━━━━━━━━━━━━━━━━━━━━━━━
 
-══ RESPONSE CRAFT RULES ══════════════════════════
-LENGTH: 180-250 words. Conversational, never like a textbook.
-SPECIFICITY: Every response must say at least 2 actual planet names + their rashi from this chart.
-TIMING: Always end with a specific time window — "April-July ${year + 1}", "Agli 3-4 mahine mein", etc.
-REMEDY: One powerful, specific remedy tied to their weakest planet (${k.weakestPlanets[0]}).
-EMOTION: If they seem worried or sad, address that warmth FIRST before the astrology.
-SHOCK: Occasionally say something they never told you but is likely true from their chart. E.g., "Main kuch aur bolunga — tumhare ${k.moonNakshatra} nakshatra ke log aksar [specific true thing] feel karte hain..."
-FOLLOW-UP: Once every 2-3 messages, ask: "Ek baat aur batao — [specific clarifying question]?"
+♄ *Saturn abhi:* ${tr.saturnCurrentRashi}
+♃ *Jupiter abhi:* ${tr.jupiterCurrentRashi}
+☊ *Rahu abhi:* ${tr.rahuCurrentRashi} | ☋ Ketu: ${tr.ketuCurrentRashi}
 
-══ WHAT MAKES PEOPLE SHARE THIS BOT ══════════════
-You say things they haven't told anyone.
-You give hope WITH specific timing — not just "sab theek hoga."
-You finish with: "Kisi ko batao mat yeh — yeh tumhara private kundali reading hai 🙏"
-(This reverse psychology makes them WANT to share it with everyone.)`;
-}
+━━━━━━━━━━━━━━━━━━━━━━━━
+*SADE SATI STATUS:*
+${sadeSatiStatus}
 
-// ── Split long text into Telegram-friendly message bubbles ────────────────────
-function splitIntoBubbles(text: string): string[] {
-  // Split on double newlines or section breaks, max 1000 chars per bubble
-  if (text.length <= 1000) return [text];
-  const chunks: string[] = [];
-  const paragraphs = text.split(/\n{2,}/);
-  let current = "";
-  for (const p of paragraphs) {
-    if ((current + "\n\n" + p).length > 900 && current) {
-      chunks.push(current.trim());
-      current = p;
-    } else {
-      current = current ? current + "\n\n" + p : p;
-    }
-  }
-  if (current.trim()) chunks.push(current.trim());
-  return chunks.length > 0 ? chunks : [text];
-}
+━━━━━━━━━━━━━━━━━━━━━━━━
+*JUPITER TRANSIT EFFECT:*
+${tr.jupiterTransitNote}`;
 
-// ── Send message with natural typing delay ────────────────────────────────────
-async function sendWithTyping(chatId: number, text: string, opts: object = {}) {
-  bot.sendChatAction(chatId, "typing").catch(() => {});
-  const typingMs = Math.min(2000, 600 + text.length * 18);
-  await delay(typingMs);
-  await bot.sendMessage(chatId, text, { ...opts });
+  // ── Page 5: Life areas analysis (static, based on planet placements) ──────
+  const lagnaIdx  = k.lagna?.rashiIndex ?? 0;
+  const houseOf   = (p: string) => k.lagna ? ((k.planets[p].rashiIndex - lagnaIdx + 12) % 12) + 1 : null;
+  const h7thLord  = k.lagna ? RASHI_LORDS[(lagnaIdx + 6) % 12] : "Unknown";
+  const h10thLord = k.lagna ? RASHI_LORDS[(lagnaIdx + 9) % 12] : "Unknown";
+  const h2ndLord  = k.lagna ? RASHI_LORDS[(lagnaIdx + 1) % 12] : "Unknown";
+
+  // Career analysis
+  const sunH   = houseOf("Sun");
+  const satH   = houseOf("Saturn");
+  const careerStr = `Sun ${k.planets.Sun.rashi} (H${sunH ?? "?"}) — ${k.planets.Sun.dignity === "Exalted" ? "bahut strong career authority" : k.planets.Sun.dignity === "Debilitated" ? "career mein extra mehnat lagegi" : "normal career strength"}. Saturn ${k.planets.Saturn.rashi} (H${satH ?? "?"}) — ${k.planets.Saturn.dignity === "Own Sign" || k.planets.Saturn.dignity === "Exalted" ? "karma acha hai, discipline se success" : "patience aur consistency zaroori hai"}. 10th lord: ${h10thLord}.`;
+
+  // Love analysis
+  const venH = houseOf("Venus");
+  const jupH = houseOf("Jupiter");
+  const loveStr = `Venus ${k.planets.Venus.rashi} (H${venH ?? "?"}) — ${k.planets.Venus.dignity === "Exalted" ? "love life mein bahut sukh" : k.planets.Venus.dignity === "Debilitated" ? "relationships mein kuch challenges" : "normal love life"}. Jupiter ${k.planets.Jupiter.rashi} (H${jupH ?? "?"}) — ${k.planets.Jupiter.dignity === "Exalted" || k.planets.Jupiter.dignity === "Own Sign" ? "excellent for marriage blessings" : "Jupiter ki strength average hai"}. 7th lord: ${h7thLord}.`;
+
+  // Wealth analysis
+  const wealthStr = `2nd lord: ${h2ndLord}. Jupiter (wealth karaka) in ${k.planets.Jupiter.rashi} — ${k.planets.Jupiter.dignity}. ${k.activeYogas.some(y => y.name.includes("Dhana")) ? "✅ Dhana Yoga present — financial success strong hai!" : "Dhana Yoga absent — paisa mehnat se aayega."}`;
+
+  const page5 = `💼 *LIFE AREAS ANALYSIS*
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+🏢 *Career & Success*
+${careerStr}
+
+❤️ *Love & Marriage*
+${loveStr}
+
+💰 *Wealth & Money*
+${wealthStr}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+_Yeh analysis tumhare actual graha positions par based hai. Timing predictions ke liye apne dasha period ko dhyan mein rakho._
+
+🙏 _Kundali padhne ke liye dhanyavaad!_`;
+
+  return [page1, page2, page3, page4, page5];
 }
 
 // ── Pay gate ──────────────────────────────────────────────────────────────────
-async function sendPayGate(chatId: number, reason: "kundali" | "chat") {
-  const msg = reason === "kundali"
-    ? `🔮 *Teaser sunke kaisa laga?*
+async function sendPayGate(chatId: number) {
+  await bot.sendMessage(chatId,
+    `🔒 *Full Kundali unlock karo!*
 
-Yeh sirf ek jhalak thi. Full kundali mein:
+Tumhe milega:
+🪐 Saare 9 graha ki exact position + dignity
+✨ Yoga analysis (Gaja Kesari, Hamsa, etc.)
+🌙 Nakshatra ka deep profile (deity, gift, shadow)
+⏰ Full Dasha timeline + upcoming dashas
+🪐 Current Saturn/Jupiter transit analysis
+🔴 Sade Sati/Dhaiyya status
+💼 Life areas: career, love, money — sab actual planets se
 
-💼 Career ka perfect time — kab change karna chahiye, kab nahi
-❤️ Love & marriage — kab hogi, kaisa hoga partner
-💰 Paisa aana kab shuru hoga — specific timing
-🏥 Health warnings — jo ignore nahi karne chahiye
-💎 Tumhara hidden strength — jo khud tumhe pata nahi
-🔮 ${new Date().getFullYear()}-${new Date().getFullYear()+2} ka complete forecast
-
-Sab kuch tumhare *actual planets* ke basis pe — koi copy-paste nahi.`
-    : `⏰ *30 second ki jhalak thi — asli baat abhi baki hai!*
-
-Pandit ji ke saath karo unlimited conversation:
-
-❓ Kab hogi meri shadi?
-💼 Yeh job/business sahi hai mere liye?
-❤️ Kya woh mera sahi partner hai?
-💰 2025-26 mein paisa kab aayega?
-🌍 Kya foreign settle hona chahiye?
-
-Har jawab tumhare *actual kundali* ke basis pe.
-Pandit ji tumhe pehchante hain — feel kiya na? 🙏`;
-
-  await bot.sendMessage(chatId, msg, {
-    parse_mode: "Markdown",
-    reply_markup: {
-      inline_keyboard: [[
-        { text: `⭐ ${PLANS.week.stars} Stars — 7 Din`, callback_data: "pay_week" },
-        { text: `⭐ ${PLANS.month.stars} Stars — 1 Mahina 🔥`, callback_data: "pay_month" },
-      ]],
-    },
-  });
+_100% tumhare actual birth data se — koi generic reading nahi_`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [[
+          { text: `⭐ ${PLANS.week.stars} Stars — 7 Din`, callback_data: "pay_week" },
+          { text: `⭐ ${PLANS.month.stars} Stars — 1 Mahina 🔥`, callback_data: "pay_month" },
+        ]],
+      },
+    }
+  );
 }
 
 async function sendInvoice(chatId: number, plan: PlanKey) {
@@ -378,7 +258,7 @@ async function sendInvoice(chatId: number, plan: PlanKey) {
   await bot.sendInvoice(
     chatId,
     `🔮 AstroBot Premium — ${p.label}`,
-    `Full Kundali + Pandit ji se unlimited chat for ${p.label}. Tumhare actual planets ke basis pe — 100% personalized.`,
+    `Full Vedic Kundali with all 9 planets, yogas, dasha, Sade Sati & transit analysis. ${p.label} access.`,
     `premium_${plan}`,
     "", "XTR",
     [{ label: `Premium ${p.label}`, amount: p.stars }]
@@ -388,27 +268,26 @@ async function sendInvoice(chatId: number, plan: PlanKey) {
 // ── Main menu ─────────────────────────────────────────────────────────────────
 async function sendMainMenu(chatId: number, user: NonNullable<Awaited<ReturnType<typeof getUser>>>) {
   const isPaid = user.has_paid;
-  const name = user.name ?? "friend";
-
-  const expiryStr = isPaid && user.premium_expires_at
+  const name   = user.name ?? "friend";
+  const expiry = isPaid && user.premium_expires_at
     ? ` (active till ${new Date(user.premium_expires_at).toLocaleDateString("en-IN")})`
     : "";
 
   const keyboard = isPaid
     ? [
-        [{ text: "🔮 Full Kundali" }, { text: "💬 Pandit ji se Pooch" }],
-        [{ text: "👤 Mera Profile" }],
+        [{ text: "🔮 Free Preview" }, { text: "💎 Full Kundali (Premium)" }],
+        [{ text: "👤 Mera Profile" }, { text: "🔄 Profile Reset" }],
       ]
     : [
-        [{ text: "🌟 Free Kundali Preview" }],
-        [{ text: "💬 Pandit ji se Pooch (30s Free)" }, { text: "⭐ Premium Lo" }],
+        [{ text: "🔮 Free Preview" }],
+        [{ text: "💎 Full Kundali Dekho" }, { text: "⭐ Premium Lo" }],
         [{ text: "👤 Mera Profile" }],
       ];
 
   await bot.sendMessage(chatId,
     isPaid
-      ? `🙏 Aao *${name}* — Premium active hai${expiryStr}.\n\nKya poochna hai aaj?`
-      : `🔮 Namaste *${name}*!\n\nTumhari kundali ready hai. Free preview dekho ya Pandit ji se seedha pooch lo! 🙏`,
+      ? `🙏 Namaste *${name}* ji — Premium active${expiry}.\n\nKya dekhna hai aaj?`
+      : `🔮 Namaste *${name}* ji!\n\nTumhari kundali ready hai. Free preview dekho ya full kundali unlock karo! 🙏`,
     { parse_mode: "Markdown", reply_markup: { keyboard, resize_keyboard: true } }
   );
 }
@@ -429,7 +308,7 @@ function registerHandlers() {
   bot.onText(/\/start/, async (msg) => {
     const id   = msg.from!.id;
     const name = msg.from!.first_name ?? "friend";
-    let user = await upsertUser(id, name);
+    let user   = await upsertUser(id, name);
 
     if (!user.dob_year) {
       await pool.query(
@@ -437,12 +316,35 @@ function registerHandlers() {
         [id]
       );
       await bot.sendMessage(id,
-        `🔮 *Namaste! Main hun AstroBot.*\n\nMain tumhari Vedic kundali banaunga — free mein — aur Pandit Ramesh Shastri ji seedhe tumse baat karenge.\n\nShuru karte hain 🙏\n\n*Tumhara naam kya hai?*`,
+        `🔮 *Namaste! Main hun AstroBot.*\n\nMain tumhari Vedic kundali banaunga — free mein — bilkul accurate, tumhare actual birth data se.\n\nShuru karte hain 🙏\n\n*Step 1/4 — Tumhara naam kya hai?*`,
         { parse_mode: "Markdown", reply_markup: { remove_keyboard: true } }
       );
     } else {
       user = await checkPremiumExpiry(user);
       await sendMainMenu(id, user);
+    }
+  });
+
+  // /kundali shortcut
+  bot.onText(/\/kundali/, async (msg) => {
+    const id = msg.from!.id;
+    let user = await getUser(id);
+    if (!user || !user.dob_year) {
+      await bot.sendMessage(id, "Pehle /start se apni birth details daalo — phir kundali milegi! 🔮");
+      return;
+    }
+    user = await checkPremiumExpiry(user);
+    if (user.has_paid) {
+      await bot.sendMessage(id, "🔮 *Tumhari Full Kundali tayaar ho rahi hai...* ✨", { parse_mode: "Markdown" });
+      const pages = buildFullKundali(user);
+      for (const page of pages) {
+        await delay(400);
+        await bot.sendMessage(id, page, { parse_mode: "Markdown" });
+      }
+    } else {
+      await bot.sendMessage(id, buildFreePreview(user), { parse_mode: "Markdown" });
+      await delay(500);
+      await sendPayGate(id);
     }
   });
 
@@ -467,10 +369,20 @@ function registerHandlers() {
 
     const user = await getUser(id);
     await bot.sendMessage(id,
-      `🎉 *Premium active ho gaya!*\n\n✅ Full Kundali\n✅ Pandit ji se unlimited chat\n✅ ${plan.label} ke liye active\n\nAb koi bhi sawaal pooch — Pandit ji tumhare saath hain! 🙏🔮`,
+      `🎉 *Premium active ho gaya!*\n\n✅ Full Kundali (5 pages)\n✅ Saare yogas, dasha, transits\n✅ ${plan.label} ke liye active\n\n*/kundali* type karo ya neeche button dabaao 🙏🔮`,
       { parse_mode: "Markdown" }
     );
     if (user) await sendMainMenu(id, user);
+  });
+
+  // Callback queries (inline buttons)
+  bot.on("callback_query", async (q) => {
+    const id   = q.from.id;
+    const data = q.data ?? "";
+    await bot.answerCallbackQuery(q.id);
+
+    if (data === "pay_week")  { await sendInvoice(id, "week");  return; }
+    if (data === "pay_month") { await sendInvoice(id, "month"); return; }
   });
 
   // Main message handler
@@ -495,7 +407,10 @@ function registerHandlers() {
         const uid = Number(text.split(" ")[1]);
         if (!isNaN(uid)) {
           const exp = new Date(Date.now() + 30 * 24 * 3600 * 1000);
-          await pool.query(`UPDATE astro_users SET has_paid=true, premium_plan='month', premium_expires_at=$1 WHERE id=$2`, [exp, uid]);
+          await pool.query(
+            `UPDATE astro_users SET has_paid=true, premium_plan='month', premium_expires_at=$1 WHERE id=$2`,
+            [exp, uid]
+          );
           await bot.sendMessage(id, `✅ Premium granted to ${uid} for 30 days`);
         }
         return;
@@ -504,17 +419,14 @@ function registerHandlers() {
       if (text === "/broadcast") {
         const users = await getUnpaidActiveUsers();
         await bot.sendMessage(id, `📡 Broadcasting to ${users.length} users...`);
-        const names = ["Priya","Divya","Ananya","Riya","Kavya","Neha","Simran","Pooja","Shruti","Meera"];
-        const rndName = () => names[Math.floor(Math.random() * names.length)];
-        const msgs = (n: string) => [
-          `🔮 *Ek baat batani thi tumhe...*\n\nTumhari kundali mein abhi ek important phase chal raha hai. Pandit ji ne ${n} ji ko yahi phase mein ek badi clarity di thi.\n\nTumhare sawal ka jawab bhi unke paas hai. 30 seconds free mein aazmaao — koi bhi sawaal pooch lo 👇`,
-          `⭐ *${n} ji boli:* "Yaar ye bot ne mujhe roula diya — itna sahi bataya"\n\nPandit ji tumhari kundali ke basis pe hi bolte hain — koi script nahi, koi generic nahi.\n\n30 seconds free trial mein khud check karo 🔮`,
-          `🌙 *Tumhare Moon ki position kuch keh rahi hai...*\n\nYeh period tumhare liye decision-making wala hai. Sahi decision ke liye kundali dekhi jaaye.\n\nPandit ji abhi available hain — seedha pooch lo 🙏\n\n👇 30 seconds bilkul free`,
-          `💭 *Kya chal raha hai tumhari life mein?*\n\nCareer? Love? Paisa? Jo bhi hai — tumhare planets sab jaante hain.\n\nPandit Ramesh Shastri ji se directly pooch lo — pehle 30 seconds free mein!`,
-        ];
         let sent = 0;
+        const msgs = [
+          `🔮 *Tumhari kundali mein kuch khaas hai...*\n\nTumhare Moon ki nakshatra position ek unique insight deti hai — jo log apne baare mein jaanna chahte hain unhe yeh zaroor dekhna chahiye.\n\n*/kundali* type karo — Free preview abhi milega 👇`,
+          `🪐 *Kya chal raha hai tumhari life mein?*\n\nCareer shift? Love ka confusion? Paisa ka tension?\n\nTumhare planets sab jaante hain — apni Free kundali dekho:\n*/kundali* 🔮`,
+          `⭐ *Saturn ka transit tumhari rashi pe hai?*\n\nSade Sati check karo — yeh 7.5 saal ka period bahut important hota hai.\n\nFree check: */kundali* type karo 🙏`,
+        ];
         for (const u of users) {
-          const m = msgs(rndName())[Math.floor(Math.random() * 4)];
+          const m = msgs[Math.floor(Math.random() * msgs.length)];
           try {
             await bot.sendMessage(u.id, m, {
               parse_mode: "Markdown",
@@ -532,13 +444,13 @@ function registerHandlers() {
       }
     }
 
-    // ── Get / ensure user ──────────────────────────────────────────────────
+    // ── Get / ensure user ───────────────────────────────────────────────────
     let user = await getUser(id);
     if (!user) { await upsertUser(id, name); user = await getUser(id); }
     if (!user) return;
     user = await checkPremiumExpiry(user);
 
-    // ── SETUP: Name ────────────────────────────────────────────────────────
+    // ── SETUP: Name ─────────────────────────────────────────────────────────
     if (user.state === "setup_name") {
       if (text.startsWith("/")) return;
       if (text.length < 2 || text.length > 40) {
@@ -547,265 +459,168 @@ function registerHandlers() {
       }
       await upsertUser(id, name, { name: text, state: "setup_dob" });
       await bot.sendMessage(id,
-        `Namaste *${text}* ji! 🙏\n\n*Step 2 / 4* — Apni *janm tithi* batao:\n\nFormat: DD/MM/YYYY\nJaise: 15/03/1995`,
+        `Namaste *${text}* ji! 🙏\n\n*Step 2/4* — Apni *janm tithi* batao:\n\nFormat: DD/MM/YYYY\nJaise: 15/03/1995`,
         { parse_mode: "Markdown", reply_markup: { remove_keyboard: true } }
       );
       return;
     }
 
-    // ── SETUP: Date of birth ───────────────────────────────────────────────
+    // ── SETUP: Date of birth ────────────────────────────────────────────────
     if (user.state === "setup_dob") {
       const parts = text.split("/");
-      if (parts.length !== 3) { await bot.sendMessage(id, "Format: DD/MM/YYYY — jaise 15/03/1995"); return; }
+      if (parts.length !== 3) {
+        await bot.sendMessage(id, "Format: DD/MM/YYYY — jaise 15/03/1995");
+        return;
+      }
       const [d, m, y] = parts.map(Number);
-      if (!d || !m || !y || d < 1 || d > 31 || m < 1 || m > 12 || y < 1900 || y > new Date().getFullYear() || isNaN(d+m+y)) {
+      if (!d || !m || !y || d < 1 || d > 31 || m < 1 || m > 12 || y < 1900 || y > new Date().getFullYear() || isNaN(d + m + y)) {
         await bot.sendMessage(id, "Sahi date daalo — jaise 15/03/1995");
         return;
       }
       await upsertUser(id, name, { dob_day: d, dob_month: m, dob_year: y, state: "setup_tob" });
       await bot.sendMessage(id,
-        `*Step 3 / 4* — Janm *samay* batao:\n\nFormat: HH:MM (24 ghante) — jaise 10:30 ya 22:45\n\n_(Agar pata na ho, skip karo — Lagna thoda different ho sakta hai)_`,
+        `✅ DOB save ho gaya!\n\n*Step 3/4* — Janm *samay* batao:\n\nFormat: HH:MM (24 ghante) — jaise 10:30 ya 22:45\n\n_(Agar pata na ho, "Skip" dabaao — Lagna thoda different hoga par baaki sab sahi rahega)_`,
         {
           parse_mode: "Markdown",
-          reply_markup: { keyboard: [[{ text: "⏭️ Samay pata nahi" }]], resize_keyboard: true, one_time_keyboard: true },
+          reply_markup: {
+            keyboard: [[{ text: "⏭️ Skip (samay pata nahi)" }]],
+            resize_keyboard: true,
+            one_time_keyboard: true,
+          },
         }
       );
       return;
     }
 
-    // ── SETUP: Time of birth ───────────────────────────────────────────────
+    // ── SETUP: Time of birth ────────────────────────────────────────────────
     if (user.state === "setup_tob") {
       let tobHour: number | null = null;
-      if (text !== "⏭️ Samay pata nahi") {
+      if (text !== "⏭️ Skip (samay pata nahi)") {
         const match = text.match(/^(\d{1,2}):(\d{2})$/);
         if (!match) {
-          await bot.sendMessage(id, "Format HH:MM mein likhna hai — jaise 10:30 ya 22:45",
-            { reply_markup: { keyboard: [[{ text: "⏭️ Samay pata nahi" }]], resize_keyboard: true, one_time_keyboard: true } }
+          await bot.sendMessage(id,
+            "Format HH:MM mein likhna hai — jaise 10:30 ya 22:45",
+            { reply_markup: { keyboard: [[{ text: "⏭️ Skip (samay pata nahi)" }]], resize_keyboard: true, one_time_keyboard: true } }
           );
           return;
         }
         const [, h, min] = match.map(Number);
-        if (h > 23 || min > 59) { await bot.sendMessage(id, "Sahi time daalo — 00:00 se 23:59 ke beech"); return; }
+        if (h > 23 || min > 59) {
+          await bot.sendMessage(id, "Sahi time daalo — 00:00 se 23:59 ke beech");
+          return;
+        }
         tobHour = h + min / 60;
       }
       await upsertUser(id, name, { tob_hour: tobHour, state: "setup_pob" });
       await bot.sendMessage(id,
-        `*Step 4 / 4* — Janm *sthan* batao:\n\nSirf city ka naam — jaise: Mumbai, Delhi, Lucknow, Patna, Jaipur`,
+        `✅ Time save!\n\n*Step 4/4* — Janm *sthan* batao:\n\nSirf city ka naam — jaise: Mumbai, Delhi, Lucknow, Patna, Jaipur`,
         { parse_mode: "Markdown", reply_markup: { remove_keyboard: true } }
       );
       return;
     }
 
-    // ── SETUP: Place of birth ──────────────────────────────────────────────
+    // ── SETUP: Place of birth ───────────────────────────────────────────────
     if (user.state === "setup_pob") {
-      if (!text || text.length < 2) { await bot.sendMessage(id, "City ka naam batao — jaise Delhi ya Mumbai"); return; }
-      await bot.sendMessage(id, `🌍 *"${text}"* dhundh raha hun... 🔮`, { parse_mode: "Markdown" });
+      if (!text || text.length < 2) {
+        await bot.sendMessage(id, "City ka naam batao — jaise Delhi ya Mumbai");
+        return;
+      }
+      await bot.sendMessage(id, `🌍 *"${text}"* dhundh raha hun...`, { parse_mode: "Markdown" });
       const geo = await geocode(text);
       if (!geo) {
-        await bot.sendMessage(id, `❌ *"${text}"* nahi mila. Thoda clearly likho — jaise "Lucknow, India" ya "Pune, Maharashtra"`, { parse_mode: "Markdown" });
+        await bot.sendMessage(id,
+          `❌ *"${text}"* nahi mila.\n\nThoda clearly likho — jaise "Lucknow, India" ya "Pune, Maharashtra"`,
+          { parse_mode: "Markdown" }
+        );
         return;
       }
       await upsertUser(id, name, { pob: geo.display, lat: geo.lat, lon: geo.lon, state: "idle" });
       const freshUser = await getUser(id);
 
-      await bot.sendMessage(id, `✅ *${geo.display}* — sahi pakda!\n\nTumhari kundali ban rahi hai... 🔮✨`, { parse_mode: "Markdown" });
-      await delay(1200);
-      bot.sendChatAction(id, "typing").catch(() => {});
+      await bot.sendMessage(id,
+        `✅ *${geo.display}* — perfect!\n\n🔮 Tumhari kundali ban rahi hai...`,
+        { parse_mode: "Markdown" }
+      );
+      await delay(1000);
 
-      const teaser = await buildTeaserReading(freshUser!);
-      const bubbles = splitIntoBubbles(teaser);
-
-      await bot.sendMessage(id, `🌟 *Tumhari Kundali — Free Preview* 🌟`, { parse_mode: "Markdown" });
-      for (const bubble of bubbles) {
-        await sendWithTyping(id, bubble);
-      }
-      await delay(800);
-      await sendPayGate(id, "kundali");
+      await bot.sendMessage(id, buildFreePreview(freshUser!), { parse_mode: "Markdown" });
+      await delay(600);
+      await sendPayGate(id);
       await sendMainMenu(id, freshUser!);
       return;
     }
 
-    // ── CHATTING state ─────────────────────────────────────────────────────
-    if (user.state === "chatting") {
-      if (text === "🔙 Menu par Wapas") {
-        const t = trialTimers.get(id);
-        if (t) { clearTimeout(t); trialTimers.delete(id); }
-        await upsertUser(id, name, { state: "idle" });
-        await clearChatHistory(id);
-        await sendMainMenu(id, user);
-        return;
-      }
-
-      // Check trial expiry for free users
-      if (!user.has_paid && user.trial_started_at) {
-        const elapsed = Date.now() - new Date(user.trial_started_at).getTime();
-        if (elapsed > TRIAL_DURATION_MS) {
-          const t = trialTimers.get(id);
-          if (t) { clearTimeout(t); trialTimers.delete(id); }
-          await upsertUser(id, name, { state: "idle" });
-          await clearChatHistory(id);
-          await sendPayGate(id, "chat");
-          await sendMainMenu(id, user);
-          return;
-        }
-      }
-
-      // Process AI reply
-      await addChatMessage(id, "user", text);
-      const freshUser = await getUser(id);
-      const history = (freshUser?.chat_history ?? []).slice(-14);
-      const sysPrompt = buildAstrologerSystemPrompt(freshUser ?? user);
-
-      bot.sendChatAction(id, "typing").catch(() => {});
-      try {
-        // Realistic delay: Pandit ji is "thinking"
-        const thinkMs = 1500 + Math.random() * 1500;
-        await delay(thinkMs);
-
-        const reply = await groqChat([{ role: "system", content: sysPrompt }, ...history], 500, 0.78);
-        await addChatMessage(id, "assistant", reply);
-
-        // Split reply into bubbles for WhatsApp feel
-        const bubbles = splitIntoBubbles(reply);
-        for (let i = 0; i < bubbles.length; i++) {
-          if (i > 0) {
-            bot.sendChatAction(id, "typing").catch(() => {});
-            await delay(800 + bubbles[i].length * 12);
-          }
-          await bot.sendMessage(id, bubbles[i], {
-            reply_markup: { keyboard: [[{ text: "🔙 Menu par Wapas" }]], resize_keyboard: true },
-          });
-        }
-      } catch {
-        await bot.sendMessage(id,
-          "🙏 Thoda network issue ho gaya. Ek baar dobara bhejo apna sawaal.",
-          { reply_markup: { keyboard: [[{ text: "🔙 Menu par Wapas" }]], resize_keyboard: true } }
-        );
-      }
-      return;
-    }
-
-    // ── Menu button handlers ───────────────────────────────────────────────
-    if (text === "🌟 Free Kundali Preview" || text === "🔮 Full Kundali") {
+    // ── Menu button: Free Preview ──────────────────────────────────────────
+    if (text === "🔮 Free Preview") {
       if (!user.dob_year) { await bot.sendMessage(id, "Pehle /start se profile complete karo!"); return; }
-      bot.sendChatAction(id, "typing").catch(() => {});
-      await delay(600);
-
-      if (user.has_paid) {
-        await bot.sendMessage(id, "🔮 *Tumhari Full Kundali tayaar ho rahi hai...* ✨", { parse_mode: "Markdown" });
-        const reading = await buildFullReading(user);
-        const bubbles = splitIntoBubbles(reading);
-        for (const bubble of bubbles) {
-          await sendWithTyping(id, bubble);
-        }
-      } else {
-        bot.sendChatAction(id, "typing").catch(() => {});
-        const teaser = await buildTeaserReading(user);
-        const bubbles = splitIntoBubbles(teaser);
-        await bot.sendMessage(id, "🌟 *Free Kundali Preview:*", { parse_mode: "Markdown" });
-        for (const bubble of bubbles) {
-          await sendWithTyping(id, bubble);
-        }
-        await delay(600);
-        await sendPayGate(id, "kundali");
+      await bot.sendMessage(id, buildFreePreview(user), { parse_mode: "Markdown" });
+      if (!user.has_paid) {
+        await delay(400);
+        await sendPayGate(id);
       }
       return;
     }
 
-    if (text === "💬 Pandit ji se Pooch (30s Free)" || text === "💬 Pandit ji se Pooch") {
-      if (!user.dob_year) { await bot.sendMessage(id, "Pehle /start se profile banao!"); return; }
+    // ── Menu button: Full Kundali ──────────────────────────────────────────
+    if (text === "💎 Full Kundali Dekho" || text === "💎 Full Kundali (Premium)") {
+      if (!user.dob_year) { await bot.sendMessage(id, "Pehle /start se profile complete karo!"); return; }
 
-      if (user.has_paid) {
-        await upsertUser(id, name, { state: "chatting" });
-        await clearChatHistory(id);
-
-        // Send the WOW opening message
-        bot.sendChatAction(id, "typing").catch(() => {});
-        await delay(1500);
-        const opening = await buildOpeningChatMessage(user);
-        await bot.sendMessage(id, opening, {
-          reply_markup: { keyboard: [[{ text: "🔙 Menu par Wapas" }]], resize_keyboard: true },
-        });
+      if (!user.has_paid) {
+        await sendPayGate(id);
         return;
       }
 
-      // Free trial
-      await upsertUser(id, name, { state: "chatting", trial_started_at: new Date() });
-      await clearChatHistory(id);
-
-      bot.sendChatAction(id, "typing").catch(() => {});
-      await delay(1500);
-      const opening = await buildOpeningChatMessage(user);
-      await bot.sendMessage(id,
-        `⏰ *30 second FREE — seedha Pandit ji se pooch lo!*\n\n${opening}`,
-        {
-          parse_mode: "Markdown",
-          reply_markup: { keyboard: [[{ text: "🔙 Menu par Wapas" }]], resize_keyboard: true },
-        }
-      );
-
-      const timer = setTimeout(async () => {
-        trialTimers.delete(id);
-        const u = await getUser(id);
-        if (u?.state === "chatting" && !u.has_paid) {
-          await upsertUser(id, name, { state: "idle" });
-          await clearChatHistory(id);
-          await bot.sendMessage(id,
-            `⏰ *30 second trial khatam!*\n\nPandit ji ka jawab mila? Woh abhi aur kuch kehna chahte hain tumse... 🙏`,
-            { parse_mode: "Markdown" }
-          ).catch(() => {});
-          await delay(1000);
-          await sendPayGate(id, "chat");
-          const fresh = await getUser(id);
-          if (fresh) await sendMainMenu(id, fresh);
-        }
-      }, TRIAL_DURATION_MS);
-      trialTimers.set(id, timer);
+      await bot.sendMessage(id, "🔮 *Tumhari Full Vedic Kundali tayaar ho rahi hai...* ✨", { parse_mode: "Markdown" });
+      const pages = buildFullKundali(user);
+      for (let i = 0; i < pages.length; i++) {
+        await delay(500);
+        await bot.sendMessage(id, pages[i], { parse_mode: "Markdown" });
+      }
       return;
     }
 
+    // ── Menu button: Premium Lo ────────────────────────────────────────────
     if (text === "⭐ Premium Lo") {
-      await bot.sendMessage(id,
-        `💎 *AstroBot Premium Plans:*\n\n⭐ *150 Stars — 7 Din*\nFull kundali + Unlimited chat\nEk baar try karo\n\n⭐ *500 Stars — 1 Mahina* 🔥\nSab kuch + Best value!\n\nDono mein milega:\n✅ Complete Kundali (7 sections)\n✅ Pandit ji se unlimited baat\n✅ ${new Date().getFullYear()}-${new Date().getFullYear()+2} forecast\n✅ Specific remedies`,
-        {
-          parse_mode: "Markdown",
-          reply_markup: { inline_keyboard: [[
-            { text: `⭐ ${PLANS.week.stars} Stars — 7 Din`, callback_data: "pay_week" },
-            { text: `⭐ ${PLANS.month.stars} Stars — 1 Mahina 🔥`, callback_data: "pay_month" },
-          ]] },
-        }
-      );
+      await sendPayGate(id);
       return;
     }
 
+    // ── Menu button: Mera Profile ──────────────────────────────────────────
     if (text === "👤 Mera Profile") {
-      if (!user.dob_year) { await bot.sendMessage(id, "/start se profile banao pehle!"); return; }
-      const k = getUserKundali(user);
-      const timeStr = user.tob_hour != null
-        ? `${Math.floor(user.tob_hour).toString().padStart(2, "0")}:${Math.round((user.tob_hour % 1) * 60).toString().padStart(2, "0")}`
-        : "Pata nahi";
-      const paidStr = user.has_paid
-        ? `✅ Premium (${user.premium_plan} — ${new Date(user.premium_expires_at!).toLocaleDateString("en-IN")} tak)`
-        : `❌ Free`;
+      const u = user;
+      const dob = u.dob_year ? `${u.dob_day}/${u.dob_month}/${u.dob_year}` : "Not set";
+      const tob = u.tob_hour != null
+        ? `${String(Math.floor(u.tob_hour)).padStart(2,"0")}:${String(Math.round((u.tob_hour % 1) * 60)).padStart(2,"0")}`
+        : "Not provided";
+      const status = u.has_paid
+        ? `✅ Premium (${u.premium_plan ?? "active"})${u.premium_expires_at ? ` — expires ${new Date(u.premium_expires_at).toLocaleDateString("en-IN")}` : ""}`
+        : "🔒 Free user";
 
       await bot.sendMessage(id,
-        `👤 *Tumhara Astro Profile*\n\nNaam: ${user.name ?? "—"}\nJanm: ${user.dob_day}/${user.dob_month}/${user.dob_year}\nSamay: ${timeStr}\nSthan: ${user.pob ?? "—"}\n\n🌟 Sun: ${k.planets.Sun.rashi}\n🌙 Moon: ${k.planets.Moon.rashi} (${k.moonNakshatra})\n${k.lagna ? `⬆️ Lagna: ${k.lagna.rashi}\n` : ""}🪐 Dasha: ${k.currentDasha} → ${k.currentAntardasha}\n\n💳 Status: ${paidStr}`,
+        `👤 *Tumhara Profile*\n\n📛 Name: ${u.name ?? "Not set"}\n📅 DOB: ${dob}\n⏰ TOB: ${tob}\n📍 POB: ${u.pob ?? "Not set"}\n⭐ Status: ${status}`,
         { parse_mode: "Markdown" }
       );
       return;
     }
 
-    // Catch-all
-    await sendMainMenu(id, user);
-  });
+    // ── Menu button: Profile Reset ─────────────────────────────────────────
+    if (text === "🔄 Profile Reset") {
+      await pool.query(
+        `UPDATE astro_users SET state='setup_name', name=NULL, dob_year=NULL, dob_month=NULL, dob_day=NULL, tob_hour=NULL, pob=NULL, lat=NULL, lon=NULL WHERE id=$1`,
+        [id]
+      );
+      await bot.sendMessage(id,
+        `🔄 Profile reset ho gaya!\n\n*Tumhara naam kya hai?*`,
+        { parse_mode: "Markdown", reply_markup: { remove_keyboard: true } }
+      );
+      return;
+    }
 
-  // Callback queries
-  bot.on("callback_query", async (q) => {
-    const id   = q.from.id;
-    const data = q.data ?? "";
-    await bot.answerCallbackQuery(q.id).catch(() => {});
-
-    if (data === "pay_week")  await sendInvoice(id, "week");
-    if (data === "pay_month") await sendInvoice(id, "month");
+    // ── Fallback ───────────────────────────────────────────────────────────
+    if (user.state === "idle" && user.dob_year) {
+      await sendMainMenu(id, user);
+    } else if (!user.dob_year) {
+      await bot.sendMessage(id, "Pehle /start se profile banao! 🔮");
+    }
   });
 }
