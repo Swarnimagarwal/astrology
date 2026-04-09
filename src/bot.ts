@@ -3,7 +3,7 @@ import axios from "axios";
 import {
   getUser, upsertUser, checkPremiumExpiry, pool,
   addChatMessage, clearChatHistory, addExtraKundali,
-  countUsers, getUnpaidActiveUsers, ExtraKundali,
+  countUsers, getUnpaidActiveUsers, getRecentUsers, getUserById, ExtraKundali,
 } from "./db.js";
 import {
   calculateKundali, buildKundaliContext, RASHI_LORDS,
@@ -28,12 +28,10 @@ const PLANS = {
 } as const;
 type PlanKey = keyof typeof PLANS;
 
-const FREE_TRIAL_MS      = 60  * 1000;        // 1 minute free trial
 const PREMIUM_CHAT_MS    = 60  * 60 * 1000;   // 1 hour premium chat window
 const MAX_KUNDALI_COUNT  = 3;                  // max 3 kundalis per premium session
 
 const delay = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
-const trialTimers = new Map<number, NodeJS.Timeout>();
 
 // ── Groq AI ───────────────────────────────────────────────────────────────────
 async function groqChat(
@@ -370,7 +368,7 @@ async function sendMainMenu(chatId: number, user: UserRow) {
       ]
     : [
         [{ text: "🔮 Free Preview" }],
-        [{ text: "💬 Pandit ji se Pooch (1 min Free)" }],
+        [{ text: "💬 Ek Sawaal Pandit ji se — Free" }],
         [{ text: "💎 Premium Lo" }, { text: "👤 Mera Profile" }],
       ];
 
@@ -471,25 +469,112 @@ function registerHandlers() {
 
     // ── Admin ───────────────────────────────────────────────────────────────
     if (id === ADMIN_ID) {
+
+      // /users — stats
       if (text === "/users") {
         const s = await countUsers();
         await bot.sendMessage(id,
-          `📊 *AstroBot Stats*\n\nTotal: ${s.total}\nPaid: ${s.paid}\nToday: ${s.today}`,
+          `📊 *AstroBot Stats*\n\nTotal users: ${s.total}\nPaid: ${s.paid}\nJoined today: ${s.today}`,
           { parse_mode: "Markdown" }
         );
         return;
       }
-      if (text.startsWith("/grantpremium ")) {
-        const uid = Number(text.split(" ")[1]);
-        if (!isNaN(uid)) {
-          await pool.query(
-            `UPDATE astro_users SET has_paid=true, premium_plan='month',
-             premium_expires_at=NOW()+INTERVAL'30 days', premium_kundali_count=1 WHERE id=$1`, [uid]
-          );
-          await bot.sendMessage(id, `✅ Premium granted to ${uid}`);
-        }
+
+      // /listusers — recent 15 users with IDs
+      if (text === "/listusers") {
+        const users = await getRecentUsers(15);
+        if (!users.length) { await bot.sendMessage(id, "No users yet."); return; }
+        const lines = users.map((u, i) => {
+          const status = u.has_paid ? `✅ ${u.premium_plan ?? "paid"}` : "🆓 free";
+          const profile = u.dob_year ? `📍 ${u.pob ?? "?"}` : "⚠️ no profile";
+          const displayName = u.name ?? u.first_name ?? "Unknown";
+          return `${i + 1}. *${displayName}* — \`${u.id}\`\n   ${status} | ${profile}`;
+        });
+        await bot.sendMessage(id,
+          `👥 *Recent Users (newest first)*\n\n${lines.join("\n\n")}`,
+          { parse_mode: "Markdown" }
+        );
         return;
       }
+
+      // /getuser <id> — full profile lookup
+      if (text.startsWith("/getuser ")) {
+        const uid = Number(text.split(" ")[1]);
+        if (isNaN(uid)) { await bot.sendMessage(id, "Usage: /getuser <telegram_id>"); return; }
+        const u = await getUserById(uid);
+        if (!u) { await bot.sendMessage(id, `❌ User ${uid} not found.`); return; }
+        const expiry = u.premium_expires_at
+          ? new Date(u.premium_expires_at).toLocaleDateString("en-IN") : "—";
+        const dob = u.dob_year ? `${u.dob_day}/${u.dob_month}/${u.dob_year}` : "Not set";
+        await bot.sendMessage(id,
+          `👤 *User Profile*\n\n` +
+          `ID: \`${u.id}\`\n` +
+          `Name: ${u.name ?? u.first_name ?? "?"}\n` +
+          `DOB: ${dob}\n` +
+          `TOB: ${u.tob_hour != null ? `${Math.floor(u.tob_hour)}:${String(Math.round((u.tob_hour % 1) * 60)).padStart(2,"0")}` : "Not given"}\n` +
+          `POB: ${u.pob ?? "Not set"}\n` +
+          `Status: ${u.has_paid ? `✅ Premium (${u.premium_plan}) until ${expiry}` : "🆓 Free"}\n` +
+          `State: ${u.state}\n` +
+          `Kundalis: ${u.premium_kundali_count}/${MAX_KUNDALI_COUNT}`,
+          { parse_mode: "Markdown" }
+        );
+        return;
+      }
+
+      // /grantpremium <id> [week|month|year] — grant premium, notify user
+      if (text.startsWith("/grantpremium ")) {
+        const parts = text.split(" ");
+        const uid   = Number(parts[1]);
+        const plan  = (parts[2] ?? "month") as "week" | "month" | "year";
+        const days  = plan === "week" ? 7 : plan === "year" ? 365 : 30;
+        if (isNaN(uid)) { await bot.sendMessage(id, "Usage: /grantpremium <id> [week|month|year]"); return; }
+        const target = await getUserById(uid);
+        if (!target) { await bot.sendMessage(id, `❌ User ${uid} not found in DB.`); return; }
+        await pool.query(
+          `UPDATE astro_users SET has_paid=true, premium_plan=$1,
+           premium_expires_at=NOW()+($2 || ' days')::INTERVAL,
+           premium_kundali_count=1, extra_kundalis='[]',
+           premium_chat_started_at=NULL, chat_history='[]' WHERE id=$3`,
+          [plan, days, uid]
+        );
+        // Notify the granted user
+        try {
+          await bot.sendMessage(uid,
+            `🎉 *Aapko Premium mil gaya!*\n\nPandit Ramesh Shastri ji ne aapko *${days} din* ka premium grant kiya hai.\n\n✅ 1 ghanta chat\n✅ 3 kundali analyze\n✅ Full analysis\n\n"Pandit ji se Pooch" dabaao — abhi shuru karo! 🙏`,
+            { parse_mode: "Markdown" }
+          );
+        } catch { /* user may have blocked */ }
+        const tName = target.name ?? target.first_name ?? String(uid);
+        await bot.sendMessage(id, `✅ Premium (${plan} / ${days} days) granted to *${tName}* (\`${uid}\`)`, { parse_mode: "Markdown" });
+        return;
+      }
+
+      // /revokepremium <id>
+      if (text.startsWith("/revokepremium ")) {
+        const uid = Number(text.split(" ")[1]);
+        if (isNaN(uid)) { await bot.sendMessage(id, "Usage: /revokepremium <id>"); return; }
+        await pool.query(
+          `UPDATE astro_users SET has_paid=false, premium_plan=NULL, premium_expires_at=NULL WHERE id=$1`, [uid]
+        );
+        await bot.sendMessage(id, `✅ Premium revoked for \`${uid}\``, { parse_mode: "Markdown" });
+        return;
+      }
+
+      // /adminhelp
+      if (text === "/adminhelp") {
+        await bot.sendMessage(id,
+          `🛠️ *Admin Commands*\n\n` +
+          `/users — stats\n` +
+          `/listusers — last 15 users with IDs\n` +
+          `/getuser <id> — full profile\n` +
+          `/grantpremium <id> [week|month|year] — grant premium (default: month)\n` +
+          `/revokepremium <id> — remove premium\n` +
+          `/broadcast — send promo to all free users`,
+          { parse_mode: "Markdown" }
+        );
+        return;
+      }
+
       if (text === "/broadcast") {
         const users = await getUnpaidActiveUsers();
         await bot.sendMessage(id, `📡 Broadcasting to ${users.length} users...`);
@@ -684,22 +769,21 @@ function registerHandlers() {
     // ── CHATTING ─────────────────────────────────────────────────────────────
     if (user.state === "chatting") {
       if (text === "🔙 Menu") {
-        const t = trialTimers.get(id); if (t) { clearTimeout(t); trialTimers.delete(id); }
         await upsertUser(id, name, { state: "idle" });
         await clearChatHistory(id);
         await sendMainMenu(id, user);
         return;
       }
 
-      // Check 1-minute free trial expiry
-      if (!user.has_paid && user.trial_started_at) {
-        const elapsed = Date.now() - new Date(user.trial_started_at).getTime();
-        if (elapsed > FREE_TRIAL_MS) {
-          const t = trialTimers.get(id); if (t) { clearTimeout(t); trialTimers.delete(id); }
+      // Free user: check if they have already gotten their 1 free answer
+      if (!user.has_paid) {
+        const prevUserMsgs = (user.chat_history ?? []).filter(h => h.role === "user").length;
+        if (prevUserMsgs >= 1) {
+          // Already used their one free question
           await upsertUser(id, name, { state: "idle" });
           await clearChatHistory(id);
           await bot.sendMessage(id,
-            `⏰ *1 minute khatam ho gayi!*\n\nPandit ji ka jawab sun ke kaisa laga? Aur bhi bahut kuch hai tumhari kundali mein... 🔮`,
+            `🔒 *Ek sawaal ka free jawab ho gaya!*\n\nPandit ji se aur baat karni hai? Premium lo — 1 ghanta, unlimited sawaal, 3 kundali 🙏`,
             { parse_mode: "Markdown" }
           );
           await sendPayGate(id, "trial_over");
@@ -732,16 +816,32 @@ function registerHandlers() {
         .slice(-12);
       const sysPrompt = buildSystemPrompt(freshUser ?? user);
 
+      const isFree = !user.has_paid;
+
+      // Free users get a super-detailed system prompt addon to encourage exhaustive answer
+      const freeAddon = isFree
+        ? `\n\n⚡ SPECIAL INSTRUCTION — FREE TRIAL ANSWER:
+This is the user's ONE FREE QUESTION. Give your MOST COMPREHENSIVE, DETAILED reading possible.
+Structure your answer in clear sections:
+1. What the planets say about this topic (name 3-4 planets with house+rashi)
+2. Current dasha impact on this topic (what ${freshUser?.chat_history?.[0]?.content ? "this area" : "their question"} looks like in ${freshUser?.chat_history?.[0]?.content ?? "this"} dasha)
+3. Specific timing — give 2-3 actual time windows in the next 18 months
+4. One powerful remedy tailored to their weakest planet
+5. A closing statement that leaves them wanting more (but don't be manipulative — be genuinely insightful)
+Write 350-450 words. This is your showcase reading — make it UNFORGETTABLE.`
+        : "";
+
       bot.sendChatAction(id, "typing").catch(() => {});
       try {
-        await delay(1200 + Math.random() * 1000);
+        await delay(1200 + Math.random() * 800);
         const reply = await groqChat(
-          [{ role: "system", content: sysPrompt }, ...history],
-          500, 0.72
+          [{ role: "system", content: sysPrompt + freeAddon }, ...history],
+          isFree ? 900 : 500,
+          isFree ? 0.75 : 0.72
         );
         await addChatMessage(id, "assistant", reply);
 
-        // Split into bubbles if reply is long
+        // Split long replies into bubbles
         const bubbles = reply.length > 900
           ? reply.split(/\n{2,}/).reduce<string[]>((acc, p) => {
               const last = acc[acc.length - 1] ?? "";
@@ -754,10 +854,23 @@ function registerHandlers() {
 
         for (let i = 0; i < bubbles.length; i++) {
           if (!bubbles[i].trim()) continue;
-          if (i > 0) { bot.sendChatAction(id, "typing").catch(() => {}); await delay(700 + bubbles[i].length * 10); }
+          if (i > 0) { bot.sendChatAction(id, "typing").catch(() => {}); await delay(600 + bubbles[i].length * 8); }
           await bot.sendMessage(id, bubbles[i], {
             reply_markup: { keyboard: [[{ text: "🔙 Menu" }]], resize_keyboard: true },
           });
+        }
+
+        // Free user: after sending the one detailed answer, show paywall
+        if (isFree) {
+          await delay(1000);
+          await upsertUser(id, name, { state: "idle" });
+          await bot.sendMessage(id,
+            `✨ *Kaisa laga Pandit ji ka jawab?*\n\nYeh sirf ek jhalak thi — tumhari kundali mein abhi bahut kuch aur chhupa hai.\n\nPremium mein milega: *1 ghanta* Pandit ji se seedhi baat, saare yogas, timing predictions, aur 3 kundali analysis 🔮`,
+            { parse_mode: "Markdown" }
+          );
+          await sendPayGate(id, "trial_over");
+          const refreshed = await getUser(id);
+          if (refreshed) await sendMainMenu(id, refreshed);
         }
       } catch (err) {
         console.error("Groq error:", err);
@@ -778,7 +891,7 @@ function registerHandlers() {
       return;
     }
 
-    if (text === "💬 Pandit ji se Pooch (1 min Free)" || text === "💬 Pandit ji se Pooch") {
+    if (text === "💬 Ek Sawaal Pandit ji se — Free" || text === "💬 Pandit ji se Pooch") {
       if (!user.dob_year) { await bot.sendMessage(id, "Pehle /start se profile banao!"); return; }
 
       if (user.has_paid) {
@@ -808,38 +921,19 @@ function registerHandlers() {
         await bot.sendMessage(id, opening, { reply_markup: { keyboard: [[{ text: "🔙 Menu" }]], resize_keyboard: true } });
 
       } else {
-        // Free 1-minute trial
+        // Free trial — 1 question, exhaustive answer, then paywall
         await pool.query(`UPDATE astro_users SET trial_started_at=NOW(), state='chatting', chat_history='[]' WHERE id=$1`, [id]);
         const freshUser = await getUser(id);
         const k = buildKundaliForUser(freshUser!);
 
-        await bot.sendMessage(id,
-          `⏱️ *1 minute free trial shuru!*\n\nPandit Ramesh Shastri ji tumse baat karne ke liye ready hain 🙏\n\nPooch lo — kuch bhi!`,
-          { parse_mode: "Markdown", reply_markup: { keyboard: [[{ text: "🔙 Menu" }]], resize_keyboard: true } }
-        );
-
-        // 1-minute countdown
-        const timer = setTimeout(async () => {
-          trialTimers.delete(id);
-          const u2 = await getUser(id);
-          if (u2?.state === "chatting" && !u2.has_paid) {
-            await upsertUser(id, name, { state: "idle" });
-            await clearChatHistory(id);
-            await bot.sendMessage(id,
-              `⏰ *1 minute khatam!*\n\nKaisa laga Pandit ji ka jawab? Tumhari kundali mein abhi bahut kuch aur hai... 🔮`,
-              { parse_mode: "Markdown" }
-            );
-            await sendPayGate(id, "trial_over");
-            await sendMainMenu(id, u2);
-          }
-        }, FREE_TRIAL_MS);
-        trialTimers.set(id, timer);
-
-        // Opening WOW message
-        await delay(1500);
+        // Opening WOW message first
+        await delay(800);
         bot.sendChatAction(id, "typing").catch(() => {});
-        const opening = await groqChat([{ role: "user", content: `You are Pandit Ramesh Shastri meeting ${user.name ?? "beta"} for the FIRST TIME. Write an opening message (4-5 sentences) that gives them chills with accuracy. Their Moon is in ${k.moonNakshatra} nakshatra. Core trait: "${k.nakshatraTraits.nature.slice(0,80)}". Hidden shadow: "${k.nakshatraTraits.shadow}". Current dasha: ${k.currentDasha}-${k.currentAntardasha}. Strongest planet: ${k.strongestPlanets[0]}. ${k.transits.sadeSati.isSadeSati ? "They are in Sade Sati — address with compassion." : ""} Start warm ("Aao beta..." or "Baitho..."). Say one SPECIFIC thing about their inner world from the nakshatra they have never been told. Then one thing about their current life phase from dasha. End: "Pooch lo — kuch bhi. Main hun 🙏". Write in warm Hinglish.` }], 180, 0.85).catch(() => `Aao ${user.name ?? "beta"} ji... 🙏\n\nTumhara ${k.moonNakshatra} nakshatra bahut kuch bol raha hai — andar se tumhara mann bahut kuch feel karta hai jo bahar nahi aata. Abhi ${k.currentDasha} dasha chal raha hai — yeh ek important turning point hai.\n\nPooch lo — kuch bhi. Main hun 🙏`);
-        await bot.sendMessage(id, opening, { reply_markup: { keyboard: [[{ text: "🔙 Menu" }]], resize_keyboard: true } });
+        const opening = await groqChat([{ role: "user", content: `You are Pandit Ramesh Shastri meeting ${user.name ?? "beta"} for the FIRST TIME. Write a 4-5 sentence opening message that feels eerily accurate. Their Moon is in ${k.moonNakshatra} nakshatra. Core trait: "${k.nakshatraTraits.nature.slice(0,80)}". Shadow: "${k.nakshatraTraits.shadow}". Dasha: ${k.currentDasha}-${k.currentAntardasha}. Strongest planet: ${k.strongestPlanets[0]}. ${k.transits.sadeSati.isSadeSati ? "They are in Sade Sati." : ""} Start with "Aao beta..." or "Baitho...". Say something specific about their inner world they have NEVER been told. End with: "Ek sawaal pooch lo — main tumhari kundali se seedha jawab dunga 🙏". Warm Hinglish.` }], 180, 0.85).catch(() => `Aao ${user.name ?? "beta"} ji... 🙏\n\nTumhara ${k.moonNakshatra} nakshatra bahut kuch keh raha hai — andar se tumhara mann zyada feel karta hai jo bahar nahi aata. Abhi ${k.currentDasha} dasha chal raha hai.\n\nEk sawaal pooch lo — main tumhari kundali se seedha jawab dunga 🙏`);
+        await bot.sendMessage(id, opening, {
+          parse_mode: "Markdown",
+          reply_markup: { keyboard: [[{ text: "🔙 Menu" }]], resize_keyboard: true },
+        });
       }
       return;
     }
