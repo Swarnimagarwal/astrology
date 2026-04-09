@@ -3,7 +3,8 @@ import axios from "axios";
 import {
   getUser, upsertUser, checkPremiumExpiry, pool,
   addChatMessage, clearChatHistory, addExtraKundali,
-  countUsers, getUnpaidActiveUsers, getRecentUsers, getUserById, ExtraKundali,
+  countUsers, getUnpaidActiveUsers, getRecentUsers, getUserById,
+  deleteUser, grantPremiumById, ExtraKundali,
 } from "./db.js";
 import {
   calculateKundali, buildKundaliContext, RASHI_LORDS,
@@ -716,55 +717,129 @@ function registerHandlers() {
         return;
       }
 
-      // /grantpremium <id> [week|month|year] — grant premium, notify user
+      // /grantpremium <id> [week|month|year] — grant premium to ANY Telegram user ID
+      // Works even if the user has never started the bot (creates a record for them)
       if (text.startsWith("/grantpremium ")) {
         const parts = text.split(" ");
         const uid   = Number(parts[1]);
-        const plan  = (parts[2] ?? "month") as "week" | "month" | "year";
+        const plan  = (["week","month","year"].includes(parts[2] ?? "") ? parts[2] : "month") as "week" | "month" | "year";
         const days  = plan === "week" ? 7 : plan === "year" ? 365 : 30;
-        if (isNaN(uid)) { await bot.sendMessage(id, "Usage: /grantpremium <id> [week|month|year]"); return; }
-        const target = await getUserById(uid);
-        if (!target) { await bot.sendMessage(id, `❌ User ${uid} not found in DB.`); return; }
-        await pool.query(
-          `UPDATE astro_users SET has_paid=true, premium_plan=$1,
-           premium_expires_at=NOW()+($2 || ' days')::INTERVAL,
-           premium_kundali_count=1, extra_kundalis='[]',
-           premium_chat_started_at=NULL, chat_history='[]' WHERE id=$3`,
-          [plan, days, uid]
-        );
-        // Notify the granted user
-        try {
-          await bot.sendMessage(uid,
-            `🎉 *Aapko Premium mil gaya!*\n\nPandit Ramesh Shastri ji ne aapko *${days} din* ka premium grant kiya hai.\n\n✅ 1 ghanta chat\n✅ 3 kundali analyze\n✅ Full analysis\n\n"Pandit ji se Pooch" dabaao — abhi shuru karo! 🙏`,
+        if (!uid || isNaN(uid)) {
+          await bot.sendMessage(id,
+            `❌ *Usage:* \`/grantpremium <telegram_id> [week|month|year]\`\n\n` +
+            `Examples:\n` +
+            `• \`/grantpremium 987654321\` — 1 month (default)\n` +
+            `• \`/grantpremium 987654321 week\` — 7 days\n` +
+            `• \`/grantpremium 987654321 year\` — 1 year\n\n` +
+            `_User does NOT need to have started the bot._`,
             { parse_mode: "Markdown" }
           );
-        } catch { /* user may have blocked */ }
-        const tName = target.name ?? target.first_name ?? String(uid);
-        await bot.sendMessage(id, `✅ Premium (${plan} / ${days} days) granted to *${tName}* (\`${uid}\`)`, { parse_mode: "Markdown" });
+          return;
+        }
+        try {
+          const result = await grantPremiumById(uid, plan, days);
+          const displayName = result.name ?? String(uid);
+          const statusNote = result.created
+            ? `_(New record created — user hasn't started bot yet)_`
+            : `_(Existing user updated)_`;
+          // Notify the user (will fail silently if they haven't started the bot)
+          try {
+            await bot.sendMessage(uid,
+              `🎉 *Aapko Premium Access mil gaya!*\n\nPandit Ramesh Shastri ji ne aapko *${days} din* ka premium grant kiya hai.\n\n` +
+              `✅ *1 ghanta* Pandit ji se seedhi baat\n` +
+              `✅ *3 kundali* analyze kar sakte ho\n` +
+              `✅ Detailed predictions aur remedies\n\n` +
+              `Bot mein jaake /start karo aur "Pandit ji se Pooch" dabaao! 🙏`,
+              { parse_mode: "Markdown" }
+            );
+          } catch { /* user hasn't started bot or has blocked — silent */ }
+          await bot.sendMessage(id,
+            `✅ *Premium granted!*\n\n` +
+            `👤 User: \`${uid}\` (${displayName})\n` +
+            `📅 Plan: ${plan} — *${days} days*\n` +
+            `⏰ Expires: ${new Date(Date.now() + days * 864e5).toLocaleDateString("en-IN")}\n` +
+            `${statusNote}`,
+            { parse_mode: "Markdown" }
+          );
+        } catch (err) {
+          await bot.sendMessage(id, `❌ Error: ${String(err).slice(0,100)}`);
+        }
+        return;
+      }
+
+      // /deleteuser <id> — permanently remove a user from the database
+      if (text.startsWith("/deleteuser ")) {
+        const uid = Number(text.split(" ")[1]);
+        if (!uid || isNaN(uid)) {
+          await bot.sendMessage(id,
+            `❌ *Usage:* \`/deleteuser <telegram_id>\`\n\nExample: \`/deleteuser 987654321\`\n\n⚠️ This permanently deletes all user data (kundali, chat history, payment status).`,
+            { parse_mode: "Markdown" }
+          );
+          return;
+        }
+        if (uid === ADMIN_ID) {
+          await bot.sendMessage(id, `⛔ Admin account cannot be deleted.`);
+          return;
+        }
+        try {
+          const result = await deleteUser(uid);
+          if (!result.found) {
+            await bot.sendMessage(id, `❌ User \`${uid}\` not found in database.`, { parse_mode: "Markdown" });
+          } else {
+            const displayName = result.name ?? "Unknown";
+            const paidNote = result.wasPaid ? `\n💳 _This user had active premium — it has been removed._` : "";
+            await bot.sendMessage(id,
+              `🗑️ *User deleted successfully*\n\n` +
+              `👤 ID: \`${uid}\`\n` +
+              `📛 Name: ${displayName}\n` +
+              `📊 All data removed: profile, kundali, chat history, payment status` +
+              `${paidNote}`,
+              { parse_mode: "Markdown" }
+            );
+          }
+        } catch (err) {
+          await bot.sendMessage(id, `❌ Delete failed: ${String(err).slice(0,100)}`);
+        }
         return;
       }
 
       // /revokepremium <id>
       if (text.startsWith("/revokepremium ")) {
         const uid = Number(text.split(" ")[1]);
-        if (isNaN(uid)) { await bot.sendMessage(id, "Usage: /revokepremium <id>"); return; }
+        if (!uid || isNaN(uid)) {
+          await bot.sendMessage(id, `❌ *Usage:* \`/revokepremium <telegram_id>\``, { parse_mode: "Markdown" });
+          return;
+        }
+        const target = await getUserById(uid);
+        if (!target) {
+          await bot.sendMessage(id, `❌ User \`${uid}\` not found.`, { parse_mode: "Markdown" });
+          return;
+        }
         await pool.query(
-          `UPDATE astro_users SET has_paid=false, premium_plan=NULL, premium_expires_at=NULL WHERE id=$1`, [uid]
+          `UPDATE astro_users SET has_paid=false, premium_plan=NULL, premium_expires_at=NULL,
+           premium_chat_started_at=NULL, premium_kundali_count=0 WHERE id=$1`, [uid]
         );
-        await bot.sendMessage(id, `✅ Premium revoked for \`${uid}\``, { parse_mode: "Markdown" });
+        const dName = target.name ?? target.first_name ?? String(uid);
+        await bot.sendMessage(id, `✅ Premium revoked for *${dName}* (\`${uid}\`)`, { parse_mode: "Markdown" });
         return;
       }
 
       // /adminhelp
       if (text === "/adminhelp") {
         await bot.sendMessage(id,
-          `🛠️ *Admin Commands*\n\n` +
-          `/users — stats\n` +
+          `🛠️ *Admin Commands — AstroVedic Bot*\n\n` +
+          `📊 *Stats & Users*\n` +
+          `/users — total stats (total, paid, today)\n` +
           `/listusers — last 15 users with IDs\n` +
-          `/getuser <id> — full profile\n` +
-          `/grantpremium <id> [week|month|year] — grant premium (default: month)\n` +
-          `/revokepremium <id> — remove premium\n` +
-          `/broadcast — send promo to all free users`,
+          `/getuser <id> — full user profile\n\n` +
+          `💎 *Premium Management*\n` +
+          `/grantpremium <id> [week|month|year] — grant premium to ANY user by Telegram ID (creates record if needed, default: month)\n` +
+          `/revokepremium <id> — remove premium from user\n\n` +
+          `🗑️ *User Management*\n` +
+          `/deleteuser <id> — permanently delete all user data\n\n` +
+          `📡 *Broadcast*\n` +
+          `/broadcast — send promo to all free users with profiles\n\n` +
+          `_Tip: Use /listusers to find IDs, /getuser to verify before granting/deleting_`,
           { parse_mode: "Markdown" }
         );
         return;
