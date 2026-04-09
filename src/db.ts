@@ -38,6 +38,7 @@ export async function initDb() {
     ALTER TABLE astro_users ADD COLUMN IF NOT EXISTS premium_chat_started_at TIMESTAMPTZ;
     ALTER TABLE astro_users ADD COLUMN IF NOT EXISTS premium_kundali_count   INT NOT NULL DEFAULT 0;
     ALTER TABLE astro_users ADD COLUMN IF NOT EXISTS extra_kundalis          JSONB NOT NULL DEFAULT '[]';
+    ALTER TABLE astro_users ADD COLUMN IF NOT EXISTS tz_offset_hours         FLOAT;
   `);
 }
 
@@ -47,6 +48,7 @@ export type ExtraKundali = {
   dob_month: number;
   dob_day: number;
   tob_hour: number | null;
+  tz_offset_hours: number | null;
   pob: string;
   lat: number | null;
   lon: number | null;
@@ -63,6 +65,7 @@ export type User = {
   pob: string | null;
   lat: number | null;
   lon: number | null;
+  tz_offset_hours: number | null;
   state: string;
   has_paid: boolean;
   premium_plan: string | null;
