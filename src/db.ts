@@ -179,3 +179,35 @@ export async function getUserById(uid: number): Promise<User | null> {
   const { rows } = await pool.query("SELECT * FROM astro_users WHERE id=$1", [uid]);
   return rows[0] ?? null;
 }
+
+// Hard-delete a user record — returns the deleted user's name/id for confirmation message
+export async function deleteUser(uid: number): Promise<{ found: boolean; name: string | null; wasPaid: boolean }> {
+  const user = await getUserById(uid);
+  if (!user) return { found: false, name: null, wasPaid: false };
+  await pool.query("DELETE FROM astro_users WHERE id=$1", [uid]);
+  return { found: true, name: user.name ?? user.first_name ?? null, wasPaid: user.has_paid };
+}
+
+// Grant premium to any Telegram user — creates a minimal record if they haven't started the bot yet
+export async function grantPremiumById(uid: number, plan: string, days: number): Promise<{ created: boolean; name: string | null }> {
+  const existing = await getUserById(uid);
+  const created = !existing;
+  if (!existing) {
+    await pool.query(
+      `INSERT INTO astro_users (id, first_name, state, has_paid, premium_plan, premium_expires_at, premium_kundali_count)
+       VALUES ($1, 'Unknown', 'idle', true, $2, NOW()+($3 || ' days')::INTERVAL, 1)
+       ON CONFLICT (id) DO NOTHING`,
+      [uid, plan, days]
+    );
+  } else {
+    await pool.query(
+      `UPDATE astro_users SET has_paid=true, premium_plan=$1,
+       premium_expires_at=NOW()+($2 || ' days')::INTERVAL,
+       premium_kundali_count=1, extra_kundalis='[]',
+       premium_chat_started_at=NULL, chat_history='[]' WHERE id=$3`,
+      [plan, days, uid]
+    );
+  }
+  const finalUser = await getUserById(uid);
+  return { created, name: finalUser?.name ?? finalUser?.first_name ?? null };
+}
