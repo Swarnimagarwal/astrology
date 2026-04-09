@@ -63,18 +63,33 @@ async function groqChat(
   return json.choices?.[0]?.message?.content?.trim() ?? "";
 }
 
-// ── Geocoding ─────────────────────────────────────────────────────────────────
-async function geocode(city: string): Promise<{ lat: number; lon: number; display: string } | null> {
+// ── Geocoding + Timezone ──────────────────────────────────────────────────────
+async function getTimezoneOffset(lat: number, lon: number): Promise<number> {
+  try {
+    const url = `https://timeapi.io/api/timezone/coordinate?latitude=${lat}&longitude=${lon}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
+    const j = await res.json() as { currentUtcOffset?: { seconds?: number } };
+    const secs = j.currentUtcOffset?.seconds ?? null;
+    if (secs !== null) return secs / 3600;   // convert seconds → hours (e.g. 19800→5.5)
+  } catch { /* fall through */ }
+  // Fallback: estimate from longitude (good enough for most cases)
+  return Math.round(lon / 15 * 2) / 2;
+}
+
+async function geocode(city: string): Promise<{ lat: number; lon: number; display: string; tzOffset: number } | null> {
   try {
     const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(city)}&format=json&limit=1`;
     const { data } = await axios.get(url, {
       headers: { "User-Agent": "AstrologyBot/1.0" }, timeout: 8000,
     });
     if (!data?.[0]) return null;
+    const lat = parseFloat(data[0].lat);
+    const lon = parseFloat(data[0].lon);
+    const tzOffset = await getTimezoneOffset(lat, lon);
     return {
-      lat: parseFloat(data[0].lat),
-      lon: parseFloat(data[0].lon),
+      lat, lon,
       display: data[0].display_name.split(",").slice(0, 2).join(", "),
+      tzOffset,
     };
   } catch { return null; }
 }
@@ -82,19 +97,31 @@ async function geocode(city: string): Promise<{ lat: number; lon: number; displa
 // ── Kundali builder ───────────────────────────────────────────────────────────
 type UserRow = NonNullable<Awaited<ReturnType<typeof getUser>>>;
 
+/** Convert local birth hour → UTC hour using stored timezone offset.
+ *  tzOffset = hours ahead of UTC (e.g. India = 5.5, Nepal = 5.75, IST-4 = -4)
+ *  If tob_hour is null (user skipped), use noon UTC (12:00) as fallback.
+ */
+function localToUtc(localHour: number | null, tzOffset: number | null): number {
+  if (localHour === null) return 12;                         // noon fallback
+  const tz = tzOffset ?? 5.5;                               // default to IST if unknown
+  return ((localHour - tz) % 24 + 24) % 24;                // wrap negative values
+}
+
 function buildKundaliForUser(user: UserRow) {
+  const utcHour = localToUtc(user.tob_hour, user.tz_offset_hours);
   return calculateKundali(
     user.dob_year!, user.dob_month!, user.dob_day!,
-    user.tob_hour ?? 12,
+    utcHour,
     user.lat, user.lon,
     new Date(user.dob_year!, (user.dob_month ?? 1) - 1, user.dob_day ?? 1)
   );
 }
 
 function buildKundaliForExtra(ek: ExtraKundali) {
+  const utcHour = localToUtc(ek.tob_hour, ek.tz_offset_hours);
   return calculateKundali(
     ek.dob_year, ek.dob_month, ek.dob_day,
-    ek.tob_hour ?? 12,
+    utcHour,
     ek.lat, ek.lon,
     new Date(ek.dob_year, ek.dob_month - 1, ek.dob_day)
   );
@@ -514,7 +541,7 @@ function registerHandlers() {
         await bot.sendMessage(id, `❌ *"${text}"* nahi mila.\n\nClearly likho — jaise "Lucknow, India"`, { parse_mode: "Markdown" });
         return;
       }
-      await upsertUser(id, name, { pob: geo.display, lat: geo.lat, lon: geo.lon, state: "idle" });
+      await upsertUser(id, name, { pob: geo.display, lat: geo.lat, lon: geo.lon, tz_offset_hours: geo.tzOffset, state: "idle" });
       const freshUser = await getUser(id);
       await bot.sendMessage(id, `✅ *${geo.display}* — 🔮 Kundali ban rahi hai...`, { parse_mode: "Markdown" });
       await delay(1000);
@@ -586,12 +613,13 @@ function registerHandlers() {
       }
       const [d, m, y] = dobEntry.content.split("/").map(Number);
       const ek: ExtraKundali = {
-        name:      nameEntry.content,
-        dob_day:   d, dob_month: m, dob_year: y,
-        tob_hour:  tobEntry?.content === "null" || !tobEntry ? null : Number(tobEntry.content),
-        pob:       geo.display,
-        lat:       geo.lat,
-        lon:       geo.lon,
+        name:            nameEntry.content,
+        dob_day:         d, dob_month: m, dob_year: y,
+        tob_hour:        tobEntry?.content === "null" || !tobEntry ? null : Number(tobEntry.content),
+        tz_offset_hours: geo.tzOffset,
+        pob:             geo.display,
+        lat:             geo.lat,
+        lon:             geo.lon,
       };
       await addExtraKundali(id, ek);
       // Clean temp entries
