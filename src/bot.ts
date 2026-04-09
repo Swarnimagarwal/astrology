@@ -242,28 +242,74 @@ RESPONSE RULES:
 }
 
 // ── Free teaser reading (no AI required as fallback) ─────────────────────────
-function staticTeaser(user: UserRow): string {
-  const k    = buildKundaliForUser(user);
-  const name = user.name ?? "ji";
+// Format degrees as  15°23'
+function fmtDeg(deg: number): string {
+  const d = Math.floor(deg);
+  const m = Math.round((deg - d) * 60);
+  return `${String(d).padStart(2, "0")}°${String(m).padStart(2, "0")}'`;
+}
+
+// Planet symbols
+const PLANET_SYMBOL: Record<string, string> = {
+  Sun: "☀️", Moon: "🌙", Mars: "♂️", Mercury: "☿", Jupiter: "♃",
+  Venus: "♀", Saturn: "♄", Rahu: "☊", Ketu: "☋",
+};
+
+// Short rashi names for table alignment
+const RASHI_SHORT: string[] = [
+  "Mesh", "Vrishabh", "Mithun", "Karka", "Simha", "Kanya",
+  "Tula", "Vrischik", "Dhanu", "Makar", "Kumbh", "Meen",
+];
+
+function buildKundaliTable(user: UserRow): string {
+  const k       = buildKundaliForUser(user);
+  const name    = user.name ?? "ji";
+  const lagnaRI = k.lagna?.rashiIndex ?? null;
+
+  const order = ["Sun","Moon","Mars","Mercury","Jupiter","Venus","Saturn","Rahu","Ketu"];
+
+  const tableRows = order.map(p => {
+    const pl  = k.planets[p];
+    const h   = lagnaRI !== null
+      ? `H${String(((pl.rashiIndex - lagnaRI + 12) % 12) + 1).padStart(2,"0")}`
+      : "H??";
+    const deg = fmtDeg(pl.degInRashi);
+    const rs  = RASHI_SHORT[pl.rashiIndex] ?? pl.rashi;
+    const tag = pl.dignity === "Exalted"     ? " Uchcha"
+              : pl.dignity === "Debilitated" ? " Neech"
+              : pl.dignity === "Own Sign"    ? " Swa"
+              : "";
+    return `${p.padEnd(9)} ${h}   ${deg}  ${rs}${tag}`;
+  }).join("\n");
+
+  const lagnaLine = k.lagna
+    ? `🌅 *Lagna:* ${k.lagna.rashi}  (${fmtDeg(k.lagna.degInRashi)})`
+    : `🌅 *Lagna:* birth time chahiye — sahi house ke liye`;
+
   const sati = k.transits.sadeSati.isSadeSati
-    ? `\n⚠️ *Sade Sati chal raha hai* — yeh period important hai, sambhal ke chalo.` : "";
-  const yoga = k.activeYogas[0]
-    ? `\n✨ *${k.activeYogas[0].name}* tumhare chart mein hai — yeh bahut acha sign hai!` : "";
-  return `🌟 *${name} ji ki Kundali — Free Preview* 🌟
+    ? `\n⚠️ *Sade Sati:* ${k.transits.sadeSati.phase} chal raha hai` : "";
+  const yogaList = k.activeYogas.length
+    ? `\n✨ *Yogas:* ${k.activeYogas.map(y => y.name).join(", ")}` : "";
 
-☀️ *Sun:* ${k.planets.Sun.rashi} — ${k.planets.Sun.dignity}
-🌙 *Moon:* ${k.planets.Moon.rashi} | *Nakshatra:* ${k.moonNakshatra} Pada ${k.moonNakshatraPada}
-${k.lagna ? `🌅 *Lagna:* ${k.lagna.rashi}` : `🌅 Lagna: (birth time chahiye)`}
+  return `🔮 *${name} ji ki Kundali* 🔮
 
-⏰ *Abhi chal raha hai:* ${k.currentDasha} Mahadasha → ${k.currentAntardasha} Antardasha
-📅 *${k.dashaBalance}*
-${sati}${yoga}
+${lagnaLine}
+🌙 *Nakshatra:* ${k.moonNakshatra} Pada ${k.moonNakshatraPada}
 
-💪 *Strongest planet:* ${k.strongestPlanets[0]}
-⚠️ *Needs attention:* ${k.weakestPlanets[0]}
+\`\`\`
+Graha     House  Degree  Rashi
+──────────────────────────────────
+${tableRows}
+\`\`\`
+
+⏳ *Dasha:* ${k.currentDasha} → ${k.currentAntardasha}
+📅 ${k.dashaBalance}${sati}${yogaList}
+
+💪 Strong: ${k.strongestPlanets.slice(0,2).join(", ")}
+⚠️ Weak: ${k.weakestPlanets.slice(0,2).join(", ")}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-🔒 _Premium mein: deep analysis, accurate predictions with timing, all yogas, Sade Sati, and Pandit ji se 1 ghante ki seedhi baat_`;
+🔒 _Premium mein: Pandit ji se seedha sawaal — 1 ghanta chat_`;
 }
 
 // ── Send paywall ──────────────────────────────────────────────────────────────
@@ -377,7 +423,7 @@ function registerHandlers() {
       await bot.sendMessage(id, "Pehle /start se apni birth details daalo! 🔮"); return;
     }
     user = await checkPremiumExpiry(user);
-    await bot.sendMessage(id, staticTeaser(user), { parse_mode: "Markdown" });
+    await bot.sendMessage(id, buildKundaliTable(user), { parse_mode: "Markdown" });
     if (!user.has_paid) { await sendPayGate(id, "upgrade"); }
   });
 
@@ -545,7 +591,7 @@ function registerHandlers() {
       const freshUser = await getUser(id);
       await bot.sendMessage(id, `✅ *${geo.display}* — 🔮 Kundali ban rahi hai...`, { parse_mode: "Markdown" });
       await delay(1000);
-      await bot.sendMessage(id, staticTeaser(freshUser!), { parse_mode: "Markdown" });
+      await bot.sendMessage(id, buildKundaliTable(freshUser!), { parse_mode: "Markdown" });
       await delay(600);
       await sendPayGate(freshUser!, "upgrade");
       await sendMainMenu(id, freshUser!);
@@ -727,7 +773,7 @@ function registerHandlers() {
 
     if (text === "🔮 Free Preview" || text === "🔮 Meri Kundali") {
       if (!user.dob_year) { await bot.sendMessage(id, "Pehle /start se profile banao!"); return; }
-      await bot.sendMessage(id, staticTeaser(user), { parse_mode: "Markdown" });
+      await bot.sendMessage(id, buildKundaliTable(user), { parse_mode: "Markdown" });
       if (!user.has_paid) { await delay(400); await sendPayGate(id, "upgrade"); }
       return;
     }
