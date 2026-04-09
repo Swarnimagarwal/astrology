@@ -459,11 +459,13 @@ function buildKundaliTable(user: UserRow): string {
       : "H??";
     const deg = fmtDeg(pl.degInRashi);
     const rs  = RASHI_SHORT[pl.rashiIndex] ?? pl.rashi;
-    const tag = pl.dignity === "Exalted"     ? " Uchcha"
-              : pl.dignity === "Debilitated" ? " Neech"
-              : pl.dignity === "Own Sign"    ? " Swa"
-              : "";
-    return `${p.padEnd(9)} ${h}   ${deg}  ${rs}${tag}`;
+    // Dignity + retrograde markers (standard Vedic notation)
+    const vakri = pl.retrograde ? "(R)" : "   ";
+    const tag   = pl.dignity === "Exalted"     ? " Uchcha"
+                : pl.dignity === "Debilitated" ? " Neech"
+                : pl.dignity === "Own Sign"    ? " Swa"
+                : "";
+    return `${p.padEnd(9)} ${h}  ${deg} ${vakri} ${rs}${tag}`;
   }).join("\n");
 
   const lagnaLine = k.lagna
@@ -475,19 +477,26 @@ function buildKundaliTable(user: UserRow): string {
   const yogaList = k.activeYogas.length
     ? `\n✨ *Yogas:* ${k.activeYogas.map(y => y.name).join(", ")}` : "";
 
+  // Retrograde planets list for clarity
+  const retrogradePlanets = order
+    .filter(p => k.planets[p].retrograde && !["Rahu","Ketu"].includes(p))
+    .join(", ");
+  const retroNote = retrogradePlanets ? `\n🔄 *Vakri (Retrograde):* ${retrogradePlanets}` : "";
+
   return `🔮 *${name} ji ki Kundali* 🔮
 
 ${lagnaLine}
 🌙 *Nakshatra:* ${k.moonNakshatra} Pada ${k.moonNakshatraPada}
 
 \`\`\`
-Graha     House  Degree  Rashi
-──────────────────────────────────
+Graha     H    Deg    Vak  Rashi
+───────────────────────────────────
 ${tableRows}
 \`\`\`
+_(R) = Vakri/Retrograde | Rahu-Ketu always (R)_
 
 ⏳ *Dasha:* ${k.currentDasha} → ${k.currentAntardasha}
-📅 ${k.dashaBalance}${sati}${yogaList}
+📅 ${k.dashaBalance}${sati}${retroNote}${yogaList}
 
 💪 Strong: ${k.strongestPlanets.slice(0,2).join(", ")}
 ⚠️ Weak: ${k.weakestPlanets.slice(0,2).join(", ")}
