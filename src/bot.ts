@@ -33,32 +33,218 @@ const MAX_KUNDALI_COUNT  = 3;                  // max 3 kundalis per premium ses
 
 const delay = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
-// ── Groq AI ───────────────────────────────────────────────────────────────────
+// ── Groq AI (with auto-retry) ─────────────────────────────────────────────────
 async function groqChat(
   messages: { role: string; content: string }[],
   maxTokens = 500,
   temperature = 0.72
 ): Promise<string> {
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${GROQ_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "llama-3.3-70b-versatile",
-      messages,
-      max_tokens: maxTokens,
-      temperature,
-    }),
-    signal: AbortSignal.timeout(30000),
-  });
-  const json = await res.json() as {
-    choices?: { message?: { content?: string } }[];
-    error?: { message?: string };
+  const MAX_TRIES = 2;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+    try {
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${GROQ_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "llama-3.3-70b-versatile",
+          messages,
+          max_tokens: maxTokens,
+          temperature,
+        }),
+        signal: AbortSignal.timeout(28000),
+      });
+      const json = await res.json() as {
+        choices?: { message?: { content?: string } }[];
+        error?: { message?: string };
+      };
+      if (!res.ok) throw new Error(json.error?.message ?? `HTTP ${res.status}`);
+      const text = json.choices?.[0]?.message?.content?.trim() ?? "";
+      if (text) return text;
+      throw new Error("Empty response from model");
+    } catch (err) {
+      lastErr = err;
+      console.error(`Groq attempt ${attempt} failed:`, String(err).slice(0, 120));
+      if (attempt < MAX_TRIES) await delay(2500);
+    }
+  }
+  throw lastErr;
+}
+
+// ── Static fallback reading (when AI unavailable) ─────────────────────────────
+// Generates a detailed, planet-specific reading from kundali data alone.
+function generateStaticReading(user: UserRow, question: string): string {
+  const k     = buildKundaliForUser(user);
+  const name  = user.name ?? "beta";
+  const yr    = new Date().getFullYear();
+  const lagnaRI = k.lagna?.rashiIndex ?? null;
+  const houseOf = (p: string): number | null =>
+    lagnaRI !== null ? ((k.planets[p].rashiIndex - lagnaRI + 12) % 12) + 1 : null;
+
+  const q = question.toLowerCase();
+  const isCareer = /job|career|kaam|naukri|business|work|promotion|office|success/.test(q);
+  const isLove   = /love|shadi|marriage|pyar|relationship|girlfriend|boyfriend|shaadi|partner|rishta/.test(q);
+  const isMoney  = /paisa|money|finance|wealth|loan|income|salary|invest|debt|earning/.test(q);
+  const isHealth = /health|sehat|bimari|illness|doctor|body|pain|hospital/.test(q);
+
+  // Remedies per planet
+  const REMEDIES: Record<string, string> = {
+    Sun:     "Sunday ko surya ko jal arpit karo — lal vastra aur gehun ka daan karo",
+    Moon:    "Somvar ko Shiv ji ko dudh chadhaao — white vastu ka daan karo",
+    Mars:    "Mangalvar ko Hanuman ji ko sindoor chadhaao — masoor daal ka daan karo",
+    Mercury: "Budhvar ko Ganesh ji ko durva arpit karo — hara rung pahno",
+    Jupiter: "Guruvar ko peele vastra mein haldi aur chana daal ka daan karo",
+    Venus:   "Shukravar ko Lakshmi ji ki puja karo — safed mithai ka prasad chadhaao",
+    Saturn:  "Shanivar ko peepal ko jal aur sarson ka tel chadhaao — kaale til ka daan karo",
+    Rahu:    "Saturday ko Bhairav ji ki puja karo — neel rung ke vastra danaan karo",
+    Ketu:    "Kutte ko roti khilaao — grey rung ka daan karo",
   };
-  if (!res.ok) throw new Error(json.error?.message ?? `HTTP ${res.status}`);
-  return json.choices?.[0]?.message?.content?.trim() ?? "";
+
+  const weak   = k.weakestPlanets[0] ?? "Saturn";
+  const strong = k.strongestPlanets[0] ?? "Jupiter";
+  const remedy = REMEDIES[weak] ?? "Mandir mein diya jalao aur mann se maango";
+
+  // Dasha-based timing
+  const dashaTimings: string[] = [
+    `${yr} ke aakhri mahine aur ${yr + 1} ki shuruaat`,
+    `${yr + 1} mein April-June ke beech`,
+    `Agli 8-10 mahine mein ek significant shift`,
+  ];
+
+  // CAREER reading
+  if (isCareer) {
+    const sun = k.planets.Sun;
+    const sat = k.planets.Saturn;
+    const hSun = houseOf("Sun"); const hSat = houseOf("Saturn");
+    return `Haan ${name} ji, tumhara sawaal dekh ke main kuch cheezein clearly bol sakta hun 🙏
+
+*Planetary Analysis — Career:*
+
+☀️ *Sun ${sun.rashi}${hSun ? ` H${hSun}` : ""}* (${sun.dignity}) — yeh tumhara authority aur recognition ka planet hai. ${sun.dignity === "Exalted" ? "Bahut strong position — promotion ke chances high hain." : sun.dignity === "Debilitated" ? "Thoda struggle hai — patience zaroori hai abhi." : "Decent position — consistent mehnat se aage badhoge."}
+
+♄ *Saturn ${sat.rashi}${hSat ? ` H${hSat}` : ""}* (${sat.dignity}) — career ka sabse important karaka. ${sat.dignity === "Exalted" || sat.dignity === "Own Sign" ? "Saturn strong hai — yeh ek bahut acha sign hai long-term growth ke liye." : "Saturn keh raha hai ki hard work ka koi shortcut nahi — par result zaroor milega."}
+
+⏳ *${k.currentDasha}-${k.currentAntardasha} Dasha* — abhi ${k.currentDasha} mahadasha chal raha hai. ${k.strongestPlanets.includes(k.currentDasha) ? `${k.currentDasha} tumhara strong planet hai — yeh dasha career ke liye favorable hai.` : `${k.currentDasha} dasha mein careful planning se kaam karo — impulsive decisions se bachna.`}
+
+*Timing Predictions:*
+🗓️ ${dashaTimings[0]} — career mein ek important decision ya opportunity
+🗓️ ${dashaTimings[1]} — financial aur professional clarity ka time
+🗓️ ${k.activeYogas[0] ? `${k.activeYogas[0].name} yoga active hai — yeh tumhare favor mein hai` : "Agle 6 mahine consistently kaam karo"}
+
+*Remedy for ${weak}:*
+🙏 ${remedy}
+
+${k.transits.sadeSati.isSadeSati ? `⚠️ *Sade Sati chal raha hai* — is period mein job change se pehle do baar socho. Stability chahiye abhi.` : "Saturn ka transit abhi favorable hai — aage badhne ka sahi waqt hai."}`;
+  }
+
+  // LOVE / MARRIAGE reading
+  if (isLove) {
+    const ven = k.planets.Venus;
+    const jup = k.planets.Jupiter;
+    const hVen = houseOf("Venus"); const hJup = houseOf("Jupiter");
+    return `${name} ji, rishte ke baare mein tumhari kundali bahut kuch keh rahi hai 🙏
+
+*Planetary Analysis — Love & Marriage:*
+
+♀ *Venus ${ven.rashi}${hVen ? ` H${hVen}` : ""}* (${ven.dignity}) — pyar aur attraction ka planet. ${ven.dignity === "Exalted" ? "Venus bahut strong — tumhara personality partner ko attract karti hai naturally." : ven.dignity === "Debilitated" ? "Venus thoda weak — relationship mein expectations clearly bolna zaroori hai." : "Venus decent — genuine connection milegi jab sahi time aayega."}
+
+♃ *Jupiter ${jup.rashi}${hJup ? ` H${hJup}` : ""}* (${jup.dignity}) — shadi ka timing planet. ${jup.dignity === "Exalted" || jup.dignity === "Own Sign" ? "Jupiter strong hai — shadi ki sambhavna is period mein high hai." : "Jupiter kehta hai ki sahi insaan dhundhne mein thoda waqt lagega — par jab milega, toh pakka hoga."}
+
+⏳ *${k.currentDasha}-${k.currentAntardasha} Dasha* — ${k.currentDasha === "Venus" || k.currentAntardasha === "Venus" ? "Venus dasha chal raha hai — yeh love life ke liye best period hai!" : k.currentDasha === "Jupiter" || k.currentAntardasha === "Jupiter" ? "Jupiter dasha — shadi ke yog bante hain is period mein." : `${k.currentDasha} dasha mein relationship mein patience aur clarity zaroori hai.`}
+
+*Timing:*
+🗓️ ${dashaTimings[0]} — koi important mulaqat ya decision
+🗓️ ${dashaTimings[1]} — relationship clarity ka waqt
+💫 Moon Nakshatra *${k.moonNakshatra}* — tumhari emotional zaroorat hai deep understanding aur trust
+
+*Remedy:*
+🙏 ${remedy}
+
+${k.activeYogas.some(y => y.name.includes("Raj") || y.name.includes("Gaja")) ? `✨ Tumhare chart mein ${k.activeYogas[0].name} hai — yeh ek very positive sign hai!` : ""}`;
+  }
+
+  // MONEY reading
+  if (isMoney) {
+    const jup = k.planets.Jupiter;
+    const hJup = houseOf("Jupiter");
+    const hMoon = houseOf("Moon");
+    return `${name} ji, paisa aur financial life ke baare mein seedha bolunga 🙏
+
+*Planetary Analysis — Wealth:*
+
+♃ *Jupiter ${jup.rashi}${hJup ? ` H${hJup}` : ""}* (${jup.dignity}) — dhan ka sabse bada karaka. ${jup.dignity === "Exalted" || jup.dignity === "Own Sign" ? "Jupiter strong hai — long-term wealth creation ke liye bahut acha chart hai tumhara." : jup.dignity === "Debilitated" ? "Jupiter thoda challenge de raha hai — unnecessary kharcha rokna zaroori hai." : "Jupiter kehta hai ki patient investing tumhe aage le jaayega."}
+
+🌙 *Moon ${k.planets.Moon.rashi}${hMoon ? ` H${hMoon}` : ""}* — man ki stability se paisa aata hai. Emotional decisions se financial loss ho sakta hai.
+
+💪 *${strong}* tumhara strongest planet hai — iska use karo apne field mein expertise banane ke liye.
+
+⏳ *${k.currentDasha} Dasha* — ${k.strongestPlanets.includes(k.currentDasha) ? "favorable dasha hai abhi income ke liye." : "is dasha mein savings pe focus karo, risk kam lo."}
+
+${k.activeYogas.some(y => y.name.includes("Dhana")) ? `✨ *Dhana Yoga* tumhare chart mein active hai — yeh wealth accumulation ka strong indicator hai!` : ""}
+
+*Timing:*
+🗓️ ${dashaTimings[0]} — financial opportunity ya income source
+🗓️ ${dashaTimings[1]} — investment decision ka sahi waqt
+🗓️ Agli 12 mahine mein ek unexpected income ka chance bhi dikh raha hai
+
+*Remedy for ${weak}:*
+🙏 ${remedy}`;
+  }
+
+  // HEALTH reading
+  if (isHealth) {
+    const mars = k.planets.Mars;
+    const hMars = houseOf("Mars");
+    const sat  = k.planets.Saturn;
+    return `${name} ji, sehat ke baare mein kundali kya keh rahi hai 🙏
+
+*Planetary Analysis — Health:*
+
+♂️ *Mars ${mars.rashi}${hMars ? ` H${hMars}` : ""}* (${mars.dignity}) — energy, blood aur stamina ka planet. ${mars.dignity === "Exalted" ? "Mars strong — physical energy aur recovery power achhi hai." : mars.dignity === "Debilitated" ? "Mars thoda weak — immune system pe dhyan do, rest zaroori hai." : "Mars theek hai — regular exercise se strength maintain hogi."}
+
+♄ *Saturn ${sat.rashi}* (${sat.dignity}) — chronic issues aur bones ka karaka. ${k.transits.sadeSati.isSadeSati ? "Sade Sati mein Saturn extra pressure de raha hai — joints, back aur stress pe dhyan do." : "Saturn abhi manageable position mein hai."}
+
+⚠️ *${weak}* is time tumhara weakest planet hai — ${weak === "Mars" ? "blood pressure, acidity, inflammation pe dhyan do" : weak === "Moon" ? "mental stress, sleep aur anxiety manage karo" : weak === "Saturn" ? "bones, joints aur chronic issues regular check karo" : weak === "Jupiter" ? "liver, diabetes aur weight pe dhyan do" : "regular health checkup zaroori hai"}.
+
+*Timing:*
+🗓️ ${dashaTimings[0]} — energy aur vitality improve hogi
+🗓️ Agli 3-4 mahine — agar koi purani problem hai toh treatment shuru karo
+
+*Remedy:*
+🙏 ${remedy}
+💊 Plus: roz subah pani peeke din shuru karo, raat ko phone band karo ek ghante pehle.`;
+  }
+
+  // GENERAL reading (default)
+  const hMoon = houseOf("Moon");
+  const hSun  = houseOf("Sun");
+  return `${name} ji, tumhari kundali dekh ke seedha bolunga 🙏
+
+*Abhi ki planetary position:*
+
+☀️ Sun ${k.planets.Sun.rashi}${hSun ? ` H${hSun}` : ""} (${k.planets.Sun.dignity})
+🌙 Moon ${k.planets.Moon.rashi}${hMoon ? ` H${hMoon}` : ""} | Nakshatra: *${k.moonNakshatra}* Pada ${k.moonNakshatraPada}
+${k.lagna ? `🌅 Lagna: ${k.lagna.rashi}` : ""}
+
+*Dasha Analysis:*
+Abhi *${k.currentDasha} Mahadasha → ${k.currentAntardasha} Antardasha* chal raha hai.
+${k.strongestPlanets.includes(k.currentDasha) ? `${k.currentDasha} tumhara strong planet hai — yeh period growth ke liye achha hai.` : `Is period mein patience aur planning se kaam lo — results milenge.`}
+${k.dashaBalance}
+
+${k.transits.sadeSati.isSadeSati ? `⚠️ *Sade Sati chal raha hai* — ${k.transits.sadeSati.phase}. Yeh tough period hai par temporary hai. Sambhal ke chalo.\n` : ""}${k.activeYogas.length ? `✨ Active Yogas: ${k.activeYogas.map(y => y.name).join(", ")}` : ""}
+
+*${yr} aur ${yr + 1} ke liye:*
+🗓️ ${dashaTimings[0]} — important change ya decision ka time
+🗓️ ${dashaTimings[1]} — clarity aur forward movement
+💪 Strongest planet *${strong}* ko activate karo apni life mein
+
+*Remedy for ${weak}:*
+🙏 ${remedy}
+
+*${k.moonNakshatra} nakshatra* waalon ki khaas baat: ${k.nakshatraTraits.gift}`;
 }
 
 // ── Geocoding + Timezone ──────────────────────────────────────────────────────
@@ -873,11 +1059,40 @@ Write 350-450 words. This is your showcase reading — make it UNFORGETTABLE.`
           if (refreshed) await sendMainMenu(id, refreshed);
         }
       } catch (err) {
-        console.error("Groq error:", err);
-        await bot.sendMessage(id,
-          "🙏 Thodi der ke liye connection slow ho gaya. Dobara bhejo apna sawaal.",
-          { reply_markup: { keyboard: [[{ text: "🔙 Menu" }]], resize_keyboard: true } }
-        );
+        console.error("Groq final error:", String(err).slice(0, 200));
+        // AI failed — give a full static reading from kundali data instead
+        const staticReply = generateStaticReading(freshUser ?? user, text);
+        await addChatMessage(id, "assistant", staticReply);
+
+        const bubbles = staticReply.split(/\n{2,}/).reduce<string[]>((acc, p) => {
+          const last = acc[acc.length - 1] ?? "";
+          if (last.length + p.length < 800) {
+            acc[acc.length - 1] = last ? last + "\n\n" + p : p;
+          } else { acc.push(p); }
+          return acc;
+        }, [""]);
+
+        for (let i = 0; i < bubbles.length; i++) {
+          if (!bubbles[i].trim()) continue;
+          if (i > 0) { bot.sendChatAction(id, "typing").catch(() => {}); await delay(700); }
+          await bot.sendMessage(id, bubbles[i], {
+            parse_mode: "Markdown",
+            reply_markup: { keyboard: [[{ text: "🔙 Menu" }]], resize_keyboard: true },
+          });
+        }
+
+        // Still show paywall for free users after static reading
+        if (isFree) {
+          await delay(1000);
+          await upsertUser(id, name, { state: "idle" });
+          await bot.sendMessage(id,
+            `✨ *Kaisa laga Pandit ji ka jawab?*\n\nYeh sirf ek jhalak thi — tumhari kundali mein abhi bahut kuch aur chhupa hai.\n\nPremium mein milega: *1 ghanta* Pandit ji se seedhi baat, saare yogas, timing predictions, aur 3 kundali analysis 🔮`,
+            { parse_mode: "Markdown" }
+          );
+          await sendPayGate(id, "trial_over");
+          const refreshed = await getUser(id);
+          if (refreshed) await sendMainMenu(id, refreshed);
+        }
       }
       return;
     }
