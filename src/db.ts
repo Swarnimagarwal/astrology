@@ -160,3 +160,22 @@ export async function getUnpaidActiveUsers(): Promise<{ id: number }[]> {
   );
   return rows;
 }
+
+export async function getRecentUsers(limit = 15): Promise<{
+  id: number; first_name: string | null; name: string | null;
+  has_paid: boolean; premium_plan: string | null;
+  premium_expires_at: Date | null; dob_year: number | null;
+  pob: string | null; created_at: Date;
+}[]> {
+  const { rows } = await pool.query(
+    `SELECT id, first_name, name, has_paid, premium_plan, premium_expires_at, dob_year, pob, created_at
+     FROM astro_users ORDER BY created_at DESC LIMIT $1`,
+    [limit]
+  );
+  return rows;
+}
+
+export async function getUserById(uid: number): Promise<User | null> {
+  const { rows } = await pool.query("SELECT * FROM astro_users WHERE id=$1", [uid]);
+  return rows[0] ?? null;
+}
