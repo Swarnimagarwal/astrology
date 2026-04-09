@@ -1,0 +1,15 @@
+[build]
+builder = "nixpacks"
+buildCommand = "npm install && node build.mjs"
+
+[deploy]
+startCommand = "node dist/index.mjs"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5
+
+[[services]]
+name = "astrobot"
+
+[deploy.healthcheck]
+path = "/health"
+timeout = 10
